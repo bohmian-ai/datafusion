@@ -19,7 +19,7 @@
 //! based on statistics (e.g. Parquet Row Groups)
 //!
 //! [`Expr`]: https://docs.rs/datafusion/latest/datafusion/logical_expr/enum.Expr.html
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::in_list::{SetMembership, unwrap_scalar};
@@ -29,7 +29,7 @@ use crate::string_in_list::{BinaryInListPruningExpr, StringInListPruningExpr};
 use arrow::array::AsArray;
 use arrow::{
     array::{ArrayRef, BooleanArray, new_null_array},
-    datatypes::{DataType, Field, Schema, SchemaRef},
+    datatypes::{DataType, Field, FieldRef, Schema, SchemaRef},
     record_batch::{RecordBatch, RecordBatchOptions},
 };
 // pub use for backwards compatibility
@@ -50,7 +50,9 @@ use datafusion_common::{
 use datafusion_expr_common::casts::try_cast_literal_to_type;
 use datafusion_expr_common::operator::Operator;
 use datafusion_physical_expr::utils::{Guarantee, LiteralGuarantee};
-use datafusion_physical_expr::{PhysicalExprRef, expressions as phys_expr};
+use datafusion_physical_expr::{
+    PhysicalExprRef, ScalarFunctionExpr, expressions as phys_expr,
+};
 use datafusion_physical_expr_common::physical_expr::snapshot_physical_expr_opt;
 use datafusion_physical_plan::{ColumnarValue, PhysicalExpr};
 
@@ -546,9 +548,11 @@ impl<'a> PruningPredicateBuilder<'a> {
         // build predicate expression once
         let mut required_columns = RequiredColumns::new();
         let mut properties = PruningExpressionProperties::default();
+        let (prunable_predicate, pruning_schema) =
+            required_columns.rewrite_struct_fields(&predicate, &file_schema)?;
         let predicate_expr = build_predicate_expression(
-            &predicate,
-            &file_schema,
+            &prunable_predicate,
+            &pruning_schema,
             &mut required_columns,
             &unhandled_hook,
             self.max_in_list_size,
@@ -870,6 +874,9 @@ pub struct RequiredColumns {
     /// * The field the statistics value should be placed in for
     ///   pruning predicate evaluation (e.g. `min_value` or `max_value`)
     columns: Vec<(phys_expr::Column, StatisticsType, Field)>,
+    /// Synthetic columns used only while building the pruning expression.
+    /// The root and path stay separate so dotted names cannot alias a field.
+    nested_columns: HashMap<phys_expr::Column, (Column, Vec<String>)>,
 }
 
 impl RequiredColumns {
@@ -877,15 +884,75 @@ impl RequiredColumns {
         Self::default()
     }
 
+    /// Replace exact struct-field access with scalar columns for the existing
+    /// pruning rules. Neither the original expression nor its schema is changed.
+    fn rewrite_struct_fields(
+        &mut self,
+        predicate: &PhysicalExprRef,
+        schema: &SchemaRef,
+    ) -> Result<(PhysicalExprRef, SchemaRef)> {
+        let mut fields = None;
+        let rewritten = Arc::clone(predicate)
+            .transform_down(|expr| {
+                if expr.downcast_ref::<ScalarFunctionExpr>().is_none() {
+                    return Ok(Transformed::no(expr));
+                }
+                let Some((root, path, field)) = struct_field_column(&expr, schema) else {
+                    return Ok(Transformed::no(expr));
+                };
+                if field.data_type().is_nested() {
+                    return Ok(Transformed::no(expr));
+                }
+                let column = if let Some((column, _)) =
+                    self.nested_columns
+                        .iter()
+                        .find(|(_, (column, field_path))| {
+                            *column == root && *field_path == path
+                        }) {
+                    column.clone()
+                } else {
+                    let fields = fields.get_or_insert_with(|| schema.fields().to_vec());
+                    let index = fields.len();
+                    let mut name = format!("__datafusion_struct_field_{index}");
+                    while fields.iter().any(|field| field.name() == &name) {
+                        name.push('_');
+                    }
+                    fields.push(Arc::new(
+                        field.as_ref().clone().with_name(&name).with_nullable(true),
+                    ));
+                    let column = phys_expr::Column::new(&name, index);
+                    self.nested_columns.insert(column.clone(), (root, path));
+                    column
+                };
+                Ok(Transformed::yes(Arc::new(column) as _))
+            })?
+            .data;
+        let schema = fields.map_or_else(
+            || Arc::clone(schema),
+            |fields| {
+                Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+            },
+        );
+        Ok((rewritten, schema))
+    }
+
     /// Returns Some(column) if this is a single column predicate.
     ///
-    /// Returns None if this is a multi-column predicate.
+    /// Returns None for multi-column predicates or nested field statistics.
     ///
     /// Examples:
     /// * `a > 5 OR a < 10` returns `Some(a)`
     /// * `a > 5 OR b < 10` returns `None`
     /// * `true` returns None
     pub fn single_column(&self) -> Option<&phys_expr::Column> {
+        // Callers of this API expect a top-level schema column (e.g. page pruning).
+        if self
+            .columns
+            .iter()
+            .any(|(column, _, _)| self.nested_columns.contains_key(column))
+        {
+            return None;
+        }
         if self.columns.windows(2).all(|w| {
             // check if all columns are the same (ignoring statistics and field)
             let c1 = &w[0].0;
@@ -1026,9 +1093,53 @@ impl RequiredColumns {
     }
 }
 
+/// Resolve only exact accessor chains rooted at a column. Casts of whole
+/// structs and repeated fields are deliberately left to the normal fallback.
+fn struct_field_column(
+    expr: &PhysicalExprRef,
+    schema: &Schema,
+) -> Option<(Column, Vec<String>, FieldRef)> {
+    if let Some(column) = expr.downcast_ref::<phys_expr::Column>() {
+        let field = schema.fields().get(column.index())?;
+        if schema
+            .fields()
+            .iter()
+            .filter(|f| f.name() == field.name())
+            .count()
+            != 1
+        {
+            return None;
+        }
+        return Some((Column::from_name(field.name()), vec![], Arc::clone(field)));
+    }
+    let function = expr.downcast_ref::<ScalarFunctionExpr>()?;
+    let access = function.struct_field_access()?;
+    let (column, mut path, mut field) =
+        struct_field_column(&function.args()[access.source_arg], schema)?;
+    for name in access.field_path {
+        let DataType::Struct(children) = field.data_type() else {
+            return None;
+        };
+        let mut matches = children.iter().filter(|child| child.name() == &name);
+        let child = Arc::clone(matches.next()?);
+        if matches.next().is_some() {
+            return None;
+        }
+        field = child;
+        path.push(name);
+    }
+    if expr.data_type(schema).ok()? != *field.data_type() {
+        return None;
+    }
+    Some((column, path, field))
+}
+
 impl From<Vec<(phys_expr::Column, StatisticsType, Field)>> for RequiredColumns {
     fn from(columns: Vec<(phys_expr::Column, StatisticsType, Field)>) -> Self {
-        Self { columns }
+        Self {
+            columns,
+            ..Default::default()
+        }
     }
 }
 
@@ -1064,15 +1175,20 @@ fn build_statistics_record_batch<S: PruningStatistics + ?Sized>(
     let mut arrays = Vec::<ArrayRef>::new();
     // For each needed statistics column:
     for (column, statistics_type, stat_field) in required_columns.iter() {
-        let column = Column::from_name(column.name());
+        let root = Column::from_name(column.name());
+        let (column, path) = required_columns
+            .nested_columns
+            .get(column)
+            .map(|(column, path)| (column, path.as_slice()))
+            .unwrap_or((&root, &[]));
         let data_type = stat_field.data_type();
 
         let num_containers = statistics.num_containers();
 
         let array = match statistics_type {
-            StatisticsType::Min => statistics.min_values(&column),
-            StatisticsType::Max => statistics.max_values(&column),
-            StatisticsType::NullCount => statistics.null_counts(&column),
+            StatisticsType::Min => statistics.min_values_for_path(column, path),
+            StatisticsType::Max => statistics.max_values_for_path(column, path),
+            StatisticsType::NullCount => statistics.null_counts_for_path(column, path),
             StatisticsType::RowCount => statistics.row_counts(),
         };
         let array = array.unwrap_or_else(|| new_null_array(data_type, num_containers));
@@ -1272,10 +1388,6 @@ fn rewrite_expr_to_prunable(
             Arc::clone(cast.target_field()),
             None,
         ));
-        // PruningPredicate does not support pruning on nested fields yet.
-        // End-to-end nested-field pruning also requires Parquet statistics
-        // extraction to agree with PruningPredicate on a stats representation
-        // for nested field expressions.
         Ok((left, op, right))
     } else if let Some(try_cast) = column_expr.downcast_ref::<phys_expr::TryCastExpr>() {
         // `try_cast(col) op lit()`
@@ -2784,6 +2896,115 @@ mod tests {
             _values: &HashSet<ScalarValue>,
         ) -> Option<BooleanArray> {
             None
+        }
+    }
+
+    #[test]
+    fn struct_field_pruning_paths_and_unsupported_statistics() {
+        use datafusion_expr::{
+            ScalarUDF, ScalarUDFImpl, Signature, StructFieldAccess, Volatility,
+        };
+
+        #[derive(Debug, PartialEq, Eq, Hash)]
+        struct FieldProbe {
+            path: Vec<String>,
+            signature: Signature,
+        }
+        impl ScalarUDFImpl for FieldProbe {
+            fn name(&self) -> &str {
+                "field_probe"
+            }
+            fn signature(&self) -> &Signature {
+                &self.signature
+            }
+            fn return_type(&self, _: &[DataType]) -> Result<DataType> {
+                Ok(DataType::Int32)
+            }
+            fn invoke_with_args(
+                &self,
+                _: datafusion_expr::ScalarFunctionArgs,
+            ) -> Result<ColumnarValue> {
+                unreachable!(
+                    "pruning must evaluate statistics, not the original accessor"
+                )
+            }
+            fn struct_field_access(
+                &self,
+                _: &[Option<ScalarValue>],
+            ) -> Option<StructFieldAccess> {
+                Some(StructFieldAccess {
+                    source_arg: 0,
+                    field_path: self.path.clone(),
+                })
+            }
+        }
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(
+                vec![
+                    Field::new("a.b", DataType::Int32, true),
+                    Field::new(
+                        "a",
+                        DataType::Struct(
+                            vec![Field::new("b", DataType::Int32, true)].into(),
+                        ),
+                        true,
+                    ),
+                    Field::new(
+                        "items",
+                        DataType::List(Arc::new(Field::new(
+                            "item",
+                            DataType::Int32,
+                            true,
+                        ))),
+                        true,
+                    ),
+                ]
+                .into(),
+            ),
+            true,
+        )]));
+        // This provider knows only top-level columns. Its bounds must never
+        // accidentally be used for a nested field.
+        let statistics = OneContainerStats {
+            min_values: Some(Arc::new(Int32Array::from(vec![0]))),
+            max_values: Some(Arc::new(Int32Array::from(vec![0]))),
+            num_containers: 1,
+        };
+        for (path, supported) in [
+            (vec!["a.b"], true),
+            (vec!["a", "b"], true),
+            (vec!["missing"], false),
+            (vec!["items", "item"], false),
+            (vec!["a"], false),
+        ] {
+            let path = path.into_iter().map(String::from).collect::<Vec<_>>();
+            let udf = ScalarUDF::from(FieldProbe {
+                path: path.clone(),
+                signature: Signature::any(1, Volatility::Immutable),
+            })
+            .with_aliases(["alias_field_probe"]);
+            let expr = logical2physical(&udf.call(vec![col("s")]).gt(lit(5)), &schema);
+            let predicate = PruningPredicateBuilder::new()
+                .with_file_schema(Arc::clone(&schema))
+                .try_build(Arc::clone(&expr))
+                .unwrap();
+            assert_eq!(predicate.always_true(), !supported, "{path:?}");
+            assert_eq!(predicate.schema(), &schema);
+            assert_eq!(predicate.orig_expr().as_ref(), expr.as_ref());
+            assert_eq!(predicate.prune(&statistics).unwrap(), vec![true]);
+            assert!(predicate.required_columns().single_column().is_none());
+            if supported {
+                assert_eq!(predicate.required_columns.nested_columns.len(), 1);
+                let (root, actual_path) = predicate
+                    .required_columns
+                    .nested_columns
+                    .values()
+                    .next()
+                    .unwrap();
+                assert_eq!(root, &Column::from_name("s"));
+                assert_eq!(actual_path, &path);
+            }
         }
     }
 

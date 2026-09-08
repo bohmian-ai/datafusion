@@ -88,6 +88,55 @@ pub trait PruningStatistics {
     /// Note: the returned array must contain [`Self::num_containers`] rows
     fn max_values(&self, column: &Column) -> Option<ArrayRef>;
 
+    /// Return minimum values for a field beneath `column`.
+    ///
+    /// `field_path` contains literal struct field names, without splitting dots.
+    /// An empty path selects the column itself. A non-empty path includes nulls
+    /// inherited from every struct ancestor. The bounds and array-length
+    /// requirements of [`Self::min_values`] apply. Providers that do not support
+    /// nested statistics return `None`.
+    fn min_values_for_path(
+        &self,
+        column: &Column,
+        field_path: &[String],
+    ) -> Option<ArrayRef> {
+        if field_path.is_empty() {
+            self.min_values(column)
+        } else {
+            None
+        }
+    }
+
+    /// Return maximum values for a struct field, following the path and bound
+    /// conventions of [`Self::min_values_for_path`] and [`Self::max_values`].
+    fn max_values_for_path(
+        &self,
+        column: &Column,
+        field_path: &[String],
+    ) -> Option<ArrayRef> {
+        if field_path.is_empty() {
+            self.max_values(column)
+        } else {
+            None
+        }
+    }
+
+    /// Return null counts for a struct field, including nulls inherited from
+    /// its ancestors. Paths follow [`Self::min_values_for_path`]; unknown counts
+    /// follow [`Self::null_counts`]. Repeated list or map elements are not rows
+    /// and must not be reported as struct-field statistics.
+    fn null_counts_for_path(
+        &self,
+        column: &Column,
+        field_path: &[String],
+    ) -> Option<ArrayRef> {
+        if field_path.is_empty() {
+            self.null_counts(column)
+        } else {
+            None
+        }
+    }
+
     /// Return the number of containers (e.g. Row Groups) being pruned with
     /// these statistics.
     ///
@@ -480,6 +529,36 @@ impl CompositePruningStatistics {
 
 #[expect(deprecated)]
 impl PruningStatistics for CompositePruningStatistics {
+    fn min_values_for_path(
+        &self,
+        column: &Column,
+        field_path: &[String],
+    ) -> Option<ArrayRef> {
+        self.statistics
+            .iter()
+            .find_map(|stats| stats.min_values_for_path(column, field_path))
+    }
+
+    fn max_values_for_path(
+        &self,
+        column: &Column,
+        field_path: &[String],
+    ) -> Option<ArrayRef> {
+        self.statistics
+            .iter()
+            .find_map(|stats| stats.max_values_for_path(column, field_path))
+    }
+
+    fn null_counts_for_path(
+        &self,
+        column: &Column,
+        field_path: &[String],
+    ) -> Option<ArrayRef> {
+        self.statistics
+            .iter()
+            .find_map(|stats| stats.null_counts_for_path(column, field_path))
+    }
+
     fn min_values(&self, column: &Column) -> Option<ArrayRef> {
         for stats in &self.statistics {
             if let Some(array) = stats.min_values(column) {

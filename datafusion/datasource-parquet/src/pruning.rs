@@ -23,7 +23,8 @@ use arrow::datatypes::Schema;
 use datafusion_expr::Operator;
 use datafusion_physical_expr::expressions::{BinaryExpr, IsNullExpr, NotExpr};
 use datafusion_physical_expr::utils::collect_columns;
-use datafusion_physical_expr::{PhysicalExpr, PhysicalExprSimplifier};
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion_physical_expr::{PhysicalExpr, PhysicalExprSimplifier, ScalarFunctionExpr};
 use datafusion_pruning::{PruningPredicate, PruningPredicateBuilder};
 
 /// Build a null-safe inverse used to prove every row matches `predicate`.
@@ -60,6 +61,25 @@ pub(crate) fn build_inverted_predicate(
             Arc::new(IsNullExpr::new(Arc::new(column))),
         ));
     }
+
+    // A non-null struct may still contain a null leaf. Guard field accesses
+    // as well as root columns before proving that every row matches.
+    predicate
+        .orig_expr()
+        .apply(|expr| {
+            if let Some(function) = expr.downcast_ref::<ScalarFunctionExpr>()
+                && function.struct_field_access().is_some()
+                && !expr.data_type(arrow_schema)?.is_nested()
+            {
+                inverted_expr = Arc::new(BinaryExpr::new(
+                    Arc::clone(&inverted_expr),
+                    Operator::Or,
+                    Arc::new(IsNullExpr::new(Arc::clone(expr))),
+                ));
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .ok()?;
 
     let simplifier = PhysicalExprSimplifier::new(arrow_schema);
     let inverted_expr = simplifier.simplify(inverted_expr).ok()?;

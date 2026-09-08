@@ -1064,3 +1064,197 @@ async fn custom_struct_accessor_pushdown_and_schema_adaptation() {
         }
     }
 }
+
+#[tokio::test]
+async fn struct_field_row_group_statistics() {
+    use arrow::array::{Array, StructArray};
+    use arrow::buffer::NullBuffer;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_expr::{ScalarUDF, Signature, Volatility};
+    use parquet::file::properties::EnabledStatistics;
+
+    for nullable_parent in [false, true] {
+        let values = Arc::new(Int32Array::from(vec![
+            Some(1),
+            Some(2),
+            Some(3),
+            Some(10),
+            None,
+            Some(12),
+            nullable_parent.then_some(100),
+            nullable_parent.then_some(100),
+            nullable_parent.then_some(100),
+            Some(20),
+            Some(21),
+            Some(22),
+        ]));
+        let deep = StructArray::from(vec![(
+            Arc::new(Field::new("value", DataType::Int32, true)),
+            values.clone() as ArrayRef,
+        )]);
+        let a = StructArray::from(vec![(
+            Arc::new(Field::new("b", DataType::Int32, false)),
+            Arc::new(Int32Array::from(vec![-100; 12])) as ArrayRef,
+        )]);
+        let s = StructArray::new(
+            vec![
+                Arc::new(Field::new("value", DataType::Int32, true)),
+                Arc::new(Field::new("deep", deep.data_type().clone(), false)),
+                Arc::new(Field::new("a.b", DataType::Int32, true)),
+                Arc::new(Field::new("a", a.data_type().clone(), false)),
+            ]
+            .into(),
+            vec![values.clone(), Arc::new(deep), values, Arc::new(a)],
+            nullable_parent.then(|| {
+                NullBuffer::from(vec![
+                    true, true, true, true, true, true, false, false, false, true, true,
+                    true,
+                ])
+            }),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("s", s.data_type().clone(), nullable_parent),
+                Field::new("id", DataType::Int32, false),
+                Field::new("s.a.b", DataType::Int32, false),
+                // Must not collide with the first synthetic pruning column.
+                Field::new("__datafusion_struct_field_4", DataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(s),
+                Arc::new(Int32Array::from_iter_values(0..12)),
+                Arc::new(Int32Array::from(vec![-100; 12])),
+                Arc::new(Int32Array::from(vec![123; 12])),
+            ],
+        )
+        .unwrap();
+        for statistics in [EnabledStatistics::None, EnabledStatistics::Chunk] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("struct-statistics.parquet");
+            let props = WriterProperties::builder()
+                .set_max_row_group_row_count(Some(3))
+                .set_statistics_enabled(statistics)
+                .build();
+            let mut writer = ArrowWriter::try_new(
+                File::create(&path).unwrap(),
+                batch.schema(),
+                Some(props),
+            )
+            .unwrap();
+            writer.write(&batch).unwrap();
+            assert_eq!(writer.close().unwrap().row_groups().len(), 4);
+            for pruning in [false, true] {
+                let mut config = SessionConfig::new()
+                    .with_target_partitions(1)
+                    .with_parquet_pruning(pruning)
+                    .with_parquet_bloom_filter_pruning(false)
+                    .with_parquet_page_index_pruning(false);
+                config.options_mut().execution.parquet.pushdown_filters = false;
+                let ctx = SessionContext::new_with_config(config);
+                for (name, declare_access) in
+                    [("alias_field_at", true), ("opaque_field_at", false)]
+                {
+                    ctx.register_udf(
+                        ScalarUDF::from(FieldAt {
+                            declare_access,
+                            signature: Signature::any(2, Volatility::Immutable),
+                        })
+                        .with_aliases([name]),
+                    );
+                }
+                ctx.register_parquet(
+                    "t",
+                    path.to_str().unwrap(),
+                    ParquetReadOptions::default(),
+                )
+                .await
+                .unwrap();
+                for (predicate, expected, pruned) in [
+                    ("s['value'] > 5", vec![3, 5, 9, 10, 11], 2),
+                    ("s['deep']['value'] > 5", vec![3, 5, 9, 10, 11], 2),
+                    ("s['a.b'] > 5", vec![3, 5, 9, 10, 11], 2),
+                    ("alias_field_at('value', s) > 5", vec![3, 5, 9, 10, 11], 2),
+                    (
+                        "alias_field_at('value', alias_field_at('deep', s)) > 5",
+                        vec![3, 5, 9, 10, 11],
+                        2,
+                    ),
+                    ("opaque_field_at('value', s) > 5", vec![3, 5, 9, 10, 11], 0),
+                    ("s['value'] = 2", vec![1], 3),
+                    ("s['value'] IS NULL", vec![4, 6, 7, 8], 2),
+                    ("s['value'] IS NOT NULL", vec![0, 1, 2, 3, 5, 9, 10, 11], 1),
+                    ("s['value'] IN (2, 12)", vec![1, 5], 2),
+                    ("s['value'] NOT IN (1, 2, 3)", vec![3, 5, 9, 10, 11], 1),
+                    ("s['value'] BETWEEN 10 AND 12", vec![3, 5], 3),
+                    (
+                        "s['value'] <= 3 OR s['value'] > 20",
+                        vec![0, 1, 2, 10, 11],
+                        2,
+                    ),
+                    ("CAST(s['value'] AS BIGINT) > 5", vec![3, 5, 9, 10, 11], 2),
+                    (
+                        "s['value'] > 5 AND __datafusion_struct_field_4 = 123",
+                        vec![3, 5, 9, 10, 11],
+                        2,
+                    ),
+                    ("s['a']['b'] > 5", vec![], 4),
+                    ("\"s.a.b\" > 5", vec![], 4),
+                ] {
+                    let plan = ctx
+                        .sql(&format!("SELECT id FROM t WHERE {predicate} ORDER BY id"))
+                        .await
+                        .unwrap()
+                        .create_physical_plan()
+                        .await
+                        .unwrap();
+                    let batches = collect(plan.clone(), ctx.task_ctx()).await.unwrap();
+                    let actual = batches
+                        .iter()
+                        .flat_map(|batch| {
+                            batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int32Array>()
+                                .unwrap()
+                                .values()
+                                .iter()
+                                .copied()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        actual, expected,
+                        "{predicate}, nullable_parent={nullable_parent}"
+                    );
+                    let metrics = TestParquetFile::parquet_metrics(&plan).unwrap();
+                    let expected_pruned =
+                        if pruning && statistics == EnabledStatistics::Chunk {
+                            pruned
+                        } else {
+                            0
+                        };
+                    assert_eq!(
+                        get_value(&metrics, "row_groups_pruned_statistics"),
+                        expected_pruned,
+                        "{predicate}, pruning={pruning}, statistics={statistics:?}, nullable_parent={nullable_parent}\n{}",
+                        displayable(plan.as_ref()).indent(false)
+                    );
+                    assert_eq!(get_value(&metrics, "predicate_evaluation_errors"), 0);
+                    assert_eq!(get_value(&metrics, "pushdown_rows_pruned"), 0);
+                    if predicate == "s['value'] BETWEEN 10 AND 12" {
+                        let Some(MetricValue::PruningMetrics {
+                            pruning_metrics, ..
+                        }) = metrics.sum_by_name("row_groups_pruned_statistics")
+                        else {
+                            panic!("missing statistics metric");
+                        };
+                        assert_eq!(
+                            pruning_metrics.fully_matched(),
+                            0,
+                            "the matching row group contains a null leaf"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

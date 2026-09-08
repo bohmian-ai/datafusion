@@ -24,7 +24,7 @@ use crate::metadata::{has_untrusted_byte_array_stats, has_untrusted_min_max_orde
 use crate::pruning::build_inverted_predicate;
 use arrow::array::{ArrayRef, BooleanArray, UInt64Array};
 use arrow::compute::nullif;
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Schema};
 use datafusion_common::pruning::PruningStatistics;
 use datafusion_common::{Column, Result, ScalarValue};
 use datafusion_datasource::FileRange;
@@ -515,11 +515,63 @@ impl<'a> RowGroupPruningStatistics<'a> {
         .with_missing_null_counts_as_zero(false))
     }
 
+    fn statistics_converter_for_path(
+        &self,
+        column: &Column,
+        field_path: &[String],
+    ) -> Option<StatisticsConverter<'a>> {
+        if field_path.is_empty() {
+            return self.statistics_converter(column).ok();
+        }
+        let mut roots = self
+            .arrow_schema
+            .fields()
+            .iter()
+            .filter(|f| f.name() == &column.name);
+        let mut field = roots.next()?.as_ref();
+        if roots.next().is_some() {
+            return None;
+        }
+        for name in field_path {
+            let DataType::Struct(fields) = field.data_type() else {
+                return None;
+            };
+            let mut matches = fields.iter().filter(|f| f.name() == name);
+            field = matches.next()?.as_ref();
+            if matches.next().is_some() {
+                return None;
+            }
+        }
+        if field.data_type().is_nested() {
+            return None;
+        }
+        let mut matches =
+            self.parquet_schema
+                .columns()
+                .iter()
+                .enumerate()
+                .filter(|(_, leaf)| {
+                    let parts = leaf.path().parts();
+                    leaf.max_rep_level() == 0
+                        && parts.first() == Some(&column.name)
+                        && parts[1..] == *field_path
+                });
+        let (index, _) = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        StatisticsConverter::from_column_index(index, field, self.parquet_schema)
+            .ok()
+            // Missing counts must not prove that a nested field has no nulls.
+            .map(|converter| converter.with_missing_null_counts_as_zero(false))
+    }
+
     fn min_max_statistics_converter(
         &self,
         column: &Column,
+        field_path: &[String],
     ) -> Option<StatisticsConverter<'a>> {
-        let converter = self.statistics_converter(column).ok()?;
+        let converter = self.statistics_converter_for_path(column, field_path)?;
         let parquet_index = converter.parquet_column_index();
         if parquet_index.is_some_and(|index| {
             has_untrusted_min_max_order(self.parquet_schema, self.column_orders, index)
@@ -552,13 +604,29 @@ impl<'a> RowGroupPruningStatistics<'a> {
 
 impl PruningStatistics for RowGroupPruningStatistics<'_> {
     fn min_values(&self, column: &Column) -> Option<ArrayRef> {
-        let converter = self.min_max_statistics_converter(column)?;
+        self.min_values_for_path(column, &[])
+    }
+
+    fn min_values_for_path(
+        &self,
+        column: &Column,
+        field_path: &[String],
+    ) -> Option<ArrayRef> {
+        let converter = self.min_max_statistics_converter(column, field_path)?;
         let values = converter.row_group_mins(self.metadata_iter()).ok()?;
         self.mask_untrusted_byte_array_stats(converter.parquet_column_index(), values)
     }
 
     fn max_values(&self, column: &Column) -> Option<ArrayRef> {
-        let converter = self.min_max_statistics_converter(column)?;
+        self.max_values_for_path(column, &[])
+    }
+
+    fn max_values_for_path(
+        &self,
+        column: &Column,
+        field_path: &[String],
+    ) -> Option<ArrayRef> {
+        let converter = self.min_max_statistics_converter(column, field_path)?;
         let values = converter.row_group_maxes(self.metadata_iter()).ok()?;
         self.mask_untrusted_byte_array_stats(converter.parquet_column_index(), values)
     }
@@ -568,8 +636,16 @@ impl PruningStatistics for RowGroupPruningStatistics<'_> {
     }
 
     fn null_counts(&self, column: &Column) -> Option<ArrayRef> {
-        self.statistics_converter(column)
-            .and_then(|c| Ok(c.row_group_null_counts(self.metadata_iter())?))
+        self.null_counts_for_path(column, &[])
+    }
+
+    fn null_counts_for_path(
+        &self,
+        column: &Column,
+        field_path: &[String],
+    ) -> Option<ArrayRef> {
+        self.statistics_converter_for_path(column, field_path)?
+            .row_group_null_counts(self.metadata_iter())
             .ok()
             .map(|counts| Arc::new(counts) as ArrayRef)
     }
@@ -1522,6 +1598,126 @@ mod tests {
         assert_pruned(row_groups, ExpectedPruning::Some(vec![0]));
         assert_eq!(metrics.row_groups_pruned_bloom_filter.pruned(), 1);
         assert_eq!(metrics.row_groups_pruned_bloom_filter.matched(), 1);
+    }
+
+    #[test]
+    fn nested_statistics_resolve_literal_paths_and_unknown_null_counts() {
+        use arrow::array::{Array, Int32Array};
+
+        let schema = Schema::new(vec![
+            Field::new(
+                "s",
+                DataType::Struct(
+                    vec![
+                        Field::new("text", DataType::Utf8, true),
+                        Field::new("a.b", DataType::Int32, true),
+                        Field::new(
+                            "a",
+                            DataType::Struct(
+                                vec![Field::new("b", DataType::Int32, true)].into(),
+                            ),
+                            true,
+                        ),
+                        Field::new(
+                            "items",
+                            DataType::List(Arc::new(Field::new(
+                                "item",
+                                DataType::Int32,
+                                true,
+                            ))),
+                            true,
+                        ),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+            Field::new("s.a.b", DataType::Int32, true),
+        ]);
+        let parquet_schema =
+            Arc::new(ArrowSchemaConverter::new().convert(&schema).unwrap());
+        let group = get_row_group_meta_data(
+            &parquet_schema,
+            vec![
+                ParquetStatistics::byte_array(
+                    Some(ByteArray::from("a")),
+                    Some(ByteArray::from("z")),
+                    None,
+                    Some(0),
+                    false,
+                ),
+                ParquetStatistics::int32(Some(11), Some(19), None, None, false),
+                ParquetStatistics::int32(Some(22), Some(29), None, Some(3), false),
+                ParquetStatistics::int32(Some(33), Some(39), None, Some(0), false),
+                ParquetStatistics::int32(Some(44), Some(49), None, Some(0), false),
+            ],
+        );
+        let stats = RowGroupPruningStatistics {
+            parquet_schema: &parquet_schema,
+            column_orders: None,
+            row_group_metadatas: vec![&group],
+            arrow_schema: &schema,
+        };
+        for (root, path, expected) in [
+            ("s", vec!["a.b".into()], 11),
+            ("s", vec!["a".into(), "b".into()], 22),
+            ("s.a.b", vec![], 44),
+        ] {
+            let values = stats
+                .min_values_for_path(&Column::from_name(root), &path)
+                .unwrap();
+            assert_eq!(
+                values
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0),
+                expected
+            );
+        }
+        let root = Column::from_name("s");
+        assert!(
+            stats.min_values_for_path(&root, &["text".into()]).is_none(),
+            "nested byte-array bounds need a trusted column order too"
+        );
+        let orders =
+            vec![
+                ColumnOrder::TYPE_DEFINED_ORDER(parquet::basic::SortOrder::UNSIGNED);
+                parquet_schema.num_columns()
+            ];
+        let trusted_stats = RowGroupPruningStatistics {
+            column_orders: Some(&orders),
+            row_group_metadatas: vec![&group],
+            parquet_schema: &parquet_schema,
+            arrow_schema: &schema,
+        };
+        assert!(
+            trusted_stats
+                .min_values_for_path(&root, &["text".into()])
+                .is_some()
+        );
+        let nulls = stats.null_counts_for_path(&root, &["a.b".into()]).unwrap();
+        assert!(nulls.is_null(0), "absent nested counts must remain unknown");
+        let nulls = stats
+            .null_counts_for_path(&root, &["a".into(), "b".into()])
+            .unwrap();
+        assert_eq!(
+            nulls
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(0),
+            3
+        );
+        for path in [
+            vec!["missing".into()],
+            vec!["items".into()],
+            vec!["items".into(), "item".into()],
+        ] {
+            assert!(stats.min_values_for_path(&root, &path).is_none());
+            assert!(stats.max_values_for_path(&root, &path).is_none());
+            assert!(stats.null_counts_for_path(&root, &path).is_none());
+        }
     }
 
     fn get_row_group_meta_data(
