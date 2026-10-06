@@ -33,6 +33,7 @@ mod metrics;
 mod nested_schema_pruning;
 mod opener;
 mod page_filter;
+pub mod physical_plan;
 mod projection_read_plan;
 mod push_decoder;
 mod reader;
@@ -55,6 +56,10 @@ pub use bloom_filter::BloomFilterStatistics;
 pub use file_format::*;
 pub use metrics::ParquetFileMetrics;
 pub use page_filter::PagePruningAccessPlanFilter;
+pub use physical_plan::{
+    PerFileParquetReadInput, PerFileParquetReadPlan, PerFileParquetReadPlanner,
+    PerFileReadFallback,
+};
 pub use reader::*; // Expose so downstream crates can use it
 pub use row_filter::build_row_filter;
 pub use row_filter::can_expr_be_pushed_down_with_schemas;
