@@ -553,7 +553,7 @@ mod test {
         Int32Array, ListBuilder, StringArray, StringBuilder, StructArray,
     };
     use arrow::datatypes::{Field, TimeUnit::Nanosecond};
-    use datafusion_expr::{Expr, col};
+    use datafusion_expr::{Expr, col, lit};
     use datafusion_functions::core::get_field;
     use datafusion_functions_nested::array_has::{
         array_has_all_udf, array_has_any_udf, array_has_udf,
