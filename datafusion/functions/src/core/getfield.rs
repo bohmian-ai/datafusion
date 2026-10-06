@@ -18,10 +18,10 @@
 use std::sync::{Arc, OnceLock};
 
 use arrow::array::{
-    Array, BooleanArray, Capacities, MutableArrayData, Scalar, cast::AsArray, make_array,
-    make_comparator,
+    Array, ArrayRef, BooleanArray, Capacities, MutableArrayData, Scalar, StructArray,
+    cast::AsArray, make_array, make_comparator,
 };
-use arrow::compute::SortOptions;
+use arrow::compute::{SortOptions, is_null, nullif};
 use arrow::datatypes::{DataType, Field, FieldRef};
 use arrow_buffer::NullBuffer;
 
@@ -193,6 +193,18 @@ fn process_map_with_nested_key(
     Ok(ColumnarValue::Array(data))
 }
 
+/// Returns `child` with every row whose `parent` struct is null also null.
+///
+/// Arrow allows a child to hold any value under a null parent, so returning the
+/// child as-is would expose those placeholders as real values, contradicting
+/// the nullable field [`GetFieldFunc`] reports for a nullable parent.
+fn child_of_parent(parent: &StructArray, child: &ArrayRef) -> Result<ArrayRef> {
+    if parent.null_count() == 0 {
+        return Ok(Arc::clone(child));
+    }
+    Ok(nullif(child, &is_null(parent)?)?)
+}
+
 /// Extract a single field from a struct or map array
 fn extract_single_field(base: ColumnarValue, name: ScalarValue) -> Result<ColumnarValue> {
     let arrays = ColumnarValue::values_to_arrays(&[base])?;
@@ -216,7 +228,7 @@ fn extract_single_field(base: ColumnarValue, name: ScalarValue) -> Result<Column
                     )
                 })?;
             Ok(ColumnarValue::Array(
-                dict.with_values(Arc::clone(field_col)),
+                dict.with_values(child_of_parent(values_struct, field_col)?),
             ))
         }
         (DataType::Map(_, _), ScalarValue::List(arr), _) => {
@@ -238,7 +250,9 @@ fn extract_single_field(base: ColumnarValue, name: ScalarValue) -> Result<Column
             let as_struct_array = as_struct_array(&array)?;
             match as_struct_array.column_by_name(&k) {
                 None => exec_err!("Field {k} not found in struct"),
-                Some(col) => Ok(ColumnarValue::Array(Arc::clone(col))),
+                Some(col) => {
+                    Ok(ColumnarValue::Array(child_of_parent(as_struct_array, col)?))
+                }
             }
         }
         (DataType::Struct(_), name, _) => exec_err!(
@@ -710,8 +724,62 @@ impl ScalarUDFImpl for GetFieldFunc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{ArrayRef, Int32Array, StructArray};
+    use arrow::array::{DictionaryArray, Int32Array};
     use arrow::datatypes::Fields;
+    use arrow::datatypes::Int8Type;
+
+    /// A nullable struct whose non-nullable child holds placeholders `0` and
+    /// `9` under its two null rows.
+    fn struct_with_null_parents() -> StructArray {
+        StructArray::new(
+            vec![Field::new("x", DataType::Int32, false)].into(),
+            vec![Arc::new(Int32Array::from(vec![1, 0, 3, 9])) as ArrayRef],
+            Some(NullBuffer::from(vec![true, false, true, false])),
+        )
+    }
+
+    #[test]
+    fn test_get_field_nulls_children_of_null_parents() -> Result<()> {
+        let expected = Int32Array::from(vec![Some(1), None, Some(3), None]);
+        let key = || ScalarValue::Utf8(Some("x".to_string()));
+
+        let plain = ColumnarValue::Array(Arc::new(struct_with_null_parents()));
+        let ColumnarValue::Array(field) = extract_single_field(plain, key())? else {
+            panic!("expected array");
+        };
+        assert_eq!(
+            field.as_primitive::<arrow::datatypes::Int32Type>(),
+            &expected
+        );
+
+        // A slice must keep the parent's nulls aligned with the child's rows.
+        let sliced =
+            ColumnarValue::Array(Arc::new(struct_with_null_parents().slice(1, 3)));
+        let ColumnarValue::Array(field) = extract_single_field(sliced, key())? else {
+            panic!("expected array");
+        };
+        assert_eq!(
+            field.as_primitive::<arrow::datatypes::Int32Type>(),
+            &expected.slice(1, 3)
+        );
+
+        let keys = arrow::array::Int8Array::from(vec![0, 1, 2, 3]);
+        let dict = DictionaryArray::<Int8Type>::try_new(
+            keys,
+            Arc::new(struct_with_null_parents()),
+        )?;
+        let ColumnarValue::Array(field) =
+            extract_single_field(ColumnarValue::Array(Arc::new(dict)), key())?
+        else {
+            panic!("expected array");
+        };
+        let field = arrow::compute::cast(&field, &DataType::Int32)?;
+        assert_eq!(
+            field.as_primitive::<arrow::datatypes::Int32Type>(),
+            &expected
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_get_field_utf8view_key() -> Result<()> {
