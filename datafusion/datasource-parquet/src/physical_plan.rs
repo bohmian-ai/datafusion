@@ -179,7 +179,13 @@ impl PerFileParquetReadPlanner {
             max_in_list_size,
         );
         let page_predicate = pruning_filter
-            .map(|filter| build_page_pruning_predicate(filter, &physical_file_schema))
+            .map(|filter| {
+                build_page_pruning_predicate(
+                    filter,
+                    &physical_file_schema,
+                    max_in_list_size,
+                )
+            })
             .filter(|predicate| predicate.filter_number() > 0);
         Ok(PerFileParquetReadPlan {
             projection_mask: read_plan.projection_mask,

@@ -20,11 +20,13 @@
 use std::sync::Arc;
 
 use arrow::datatypes::Schema;
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_expr::Operator;
 use datafusion_physical_expr::expressions::{BinaryExpr, IsNullExpr, NotExpr};
 use datafusion_physical_expr::utils::collect_columns;
-use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion_physical_expr::{PhysicalExpr, PhysicalExprSimplifier, ScalarFunctionExpr};
+use datafusion_physical_expr::{
+    PhysicalExpr, PhysicalExprSimplifier, ScalarFunctionExpr,
+};
 use datafusion_pruning::{PruningPredicate, PruningPredicateBuilder};
 
 /// Build a null-safe inverse used to prove every row matches `predicate`.
