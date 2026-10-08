@@ -313,12 +313,7 @@ impl AsyncFileReader for ParquetFileReader {
                 .with_page_index_policy(page_index_policy)
                 .fetch_metadata()
                 .await
-                .map_err(|e| {
-                    ParquetError::General(format!(
-                        "Failed to fetch metadata for file {}: {e}",
-                        object_meta.location,
-                    ))
-                })
+                .map_err(|e| ParquetError::External(Box::new(e)))
         }
         .boxed()
     }
