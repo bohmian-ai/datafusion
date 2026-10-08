@@ -218,10 +218,15 @@ mod tests {
     /// A file whose single `id` column spans 1..=10, and the pruner for
     /// `id = 5` over it.
     fn pruner() -> (FilePruner, Arc<dyn PhysicalExpr>, SchemaRef) {
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let predicate =
-            binary(col("id", &schema).unwrap(), Operator::Eq, lit(5i32), &schema)
-                .unwrap();
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let predicate = binary(
+            col("id", &schema).unwrap(),
+            Operator::Eq,
+            lit(5i32),
+            &schema,
+        )
+        .unwrap();
         let stats = Statistics {
             num_rows: Precision::Exact(10),
             total_byte_size: Precision::Absent,
@@ -241,7 +246,11 @@ mod tests {
     #[test]
     fn reuses_the_build_only_for_the_same_predicate_and_schema() {
         let (mut pruner, predicate, schema) = pruner();
-        assert!(pruner.reusable_pruning_predicate(&predicate, &schema).is_none());
+        assert!(
+            pruner
+                .reusable_pruning_predicate(&predicate, &schema)
+                .is_none()
+        );
 
         assert!(!pruner.should_prune().unwrap());
         let reused = pruner.reusable_pruning_predicate(&predicate, &schema);
@@ -254,8 +263,13 @@ mod tests {
                 .is_some()
         );
 
-        let other = binary(col("id", &schema).unwrap(), Operator::Eq, lit(5i32), &schema)
-            .unwrap();
+        let other = binary(
+            col("id", &schema).unwrap(),
+            Operator::Eq,
+            lit(5i32),
+            &schema,
+        )
+        .unwrap();
         assert!(pruner.reusable_pruning_predicate(&other, &schema).is_none());
 
         let other_schema =
