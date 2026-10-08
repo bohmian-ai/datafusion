@@ -70,6 +70,10 @@ pub fn try_cast_literal_to_type(
         // null value can be cast to any type of null value
         return ScalarValue::try_from(target_type).ok();
     }
+    if lit_data_type == *target_type {
+        // a cast that changes only field metadata or nullability keeps the value
+        return Some(lit_value.clone());
+    }
     try_cast_numeric_literal(lit_value, target_type)
         .or_else(|| try_cast_string_literal(lit_value, target_type))
         .or_else(|| try_cast_dictionary(lit_value, target_type))
@@ -1527,6 +1531,18 @@ mod tests {
             ScalarValue::Binary(Some(vec![42])),
             DataType::FixedSizeBinary(1),
             ExpectedCast::Value(ScalarValue::FixedSizeBinary(1, Some(vec![42]))),
+        );
+
+        // Test same type: a metadata-only cast unwraps
+        expect_cast(
+            ScalarValue::FixedSizeBinary(3, Some(vec![1, 2, 3])),
+            DataType::FixedSizeBinary(3),
+            ExpectedCast::Value(ScalarValue::FixedSizeBinary(3, Some(vec![1, 2, 3]))),
+        );
+        expect_cast(
+            ScalarValue::Binary(Some(vec![1, 2])),
+            DataType::Binary,
+            ExpectedCast::Value(ScalarValue::Binary(Some(vec![1, 2]))),
         );
     }
 
