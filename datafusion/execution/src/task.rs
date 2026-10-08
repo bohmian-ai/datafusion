@@ -57,13 +57,13 @@ pub struct TaskContext {
     /// Session configuration
     session_config: SessionConfig,
     /// Scalar functions associated with this task context
-    scalar_functions: HashMap<String, Arc<ScalarUDF>>,
+    scalar_functions: Arc<HashMap<String, Arc<ScalarUDF>>>,
     /// Higher order functions associated with this task context
-    higher_order_functions: HashMap<String, Arc<HigherOrderUDF>>,
+    higher_order_functions: Arc<HashMap<String, Arc<HigherOrderUDF>>>,
     /// Aggregate functions associated with this task context
-    aggregate_functions: HashMap<String, Arc<AggregateUDF>>,
+    aggregate_functions: Arc<HashMap<String, Arc<AggregateUDF>>>,
     /// Window functions associated with this task context
-    window_functions: HashMap<String, Arc<WindowUDF>>,
+    window_functions: Arc<HashMap<String, Arc<WindowUDF>>>,
     /// Runtime environment associated with this task context
     runtime: Arc<RuntimeEnv>,
 }
@@ -77,10 +77,10 @@ impl Default for TaskContext {
             session_id: "DEFAULT".to_string(),
             task_id: None,
             session_config: SessionConfig::new(),
-            scalar_functions: HashMap::new(),
-            higher_order_functions: HashMap::new(),
-            aggregate_functions: HashMap::new(),
-            window_functions: HashMap::new(),
+            scalar_functions: Arc::default(),
+            higher_order_functions: Arc::default(),
+            aggregate_functions: Arc::default(),
+            window_functions: Arc::default(),
             runtime,
         }
     }
@@ -107,10 +107,10 @@ impl TaskContext {
             session_id,
             task_id,
             session_config,
-            scalar_functions,
-            higher_order_functions,
-            aggregate_functions,
-            window_functions,
+            scalar_functions: Arc::new(scalar_functions),
+            higher_order_functions: Arc::new(higher_order_functions),
+            aggregate_functions: Arc::new(aggregate_functions),
+            window_functions: Arc::new(window_functions),
             runtime,
         }
     }
@@ -168,6 +168,24 @@ impl TaskContext {
         self
     }
 
+    /// Replace the function registries with ones shared with their owner,
+    /// typically a session, so building a context per query does not copy
+    /// every registered function. A later `register_*` call on this context
+    /// copies the affected registry first, leaving the owner's untouched.
+    pub fn with_shared_functions(
+        mut self,
+        scalar_functions: Arc<HashMap<String, Arc<ScalarUDF>>>,
+        higher_order_functions: Arc<HashMap<String, Arc<HigherOrderUDF>>>,
+        aggregate_functions: Arc<HashMap<String, Arc<AggregateUDF>>>,
+        window_functions: Arc<HashMap<String, Arc<WindowUDF>>>,
+    ) -> Self {
+        self.scalar_functions = scalar_functions;
+        self.higher_order_functions = higher_order_functions;
+        self.aggregate_functions = aggregate_functions;
+        self.window_functions = window_functions;
+        self
+    }
+
     /// Update the `task_id`
     pub fn with_task_id(mut self, task_id: String) -> Self {
         self.task_id = Some(task_id);
@@ -219,38 +237,36 @@ impl FunctionRegistry for TaskContext {
         &mut self,
         udaf: Arc<AggregateUDF>,
     ) -> Result<Option<Arc<AggregateUDF>>> {
+        let aggregate_functions = Arc::make_mut(&mut self.aggregate_functions);
         udaf.aliases().iter().for_each(|alias| {
-            self.aggregate_functions
-                .insert(alias.clone(), Arc::clone(&udaf));
+            aggregate_functions.insert(alias.clone(), Arc::clone(&udaf));
         });
-        Ok(self.aggregate_functions.insert(udaf.name().into(), udaf))
+        Ok(aggregate_functions.insert(udaf.name().into(), udaf))
     }
     fn register_udwf(&mut self, udwf: Arc<WindowUDF>) -> Result<Option<Arc<WindowUDF>>> {
+        let window_functions = Arc::make_mut(&mut self.window_functions);
         udwf.aliases().iter().for_each(|alias| {
-            self.window_functions
-                .insert(alias.clone(), Arc::clone(&udwf));
+            window_functions.insert(alias.clone(), Arc::clone(&udwf));
         });
-        Ok(self.window_functions.insert(udwf.name().into(), udwf))
+        Ok(window_functions.insert(udwf.name().into(), udwf))
     }
     fn register_udf(&mut self, udf: Arc<ScalarUDF>) -> Result<Option<Arc<ScalarUDF>>> {
+        let scalar_functions = Arc::make_mut(&mut self.scalar_functions);
         udf.aliases().iter().for_each(|alias| {
-            self.scalar_functions
-                .insert(alias.clone(), Arc::clone(&udf));
+            scalar_functions.insert(alias.clone(), Arc::clone(&udf));
         });
-        Ok(self.scalar_functions.insert(udf.name().into(), udf))
+        Ok(scalar_functions.insert(udf.name().into(), udf))
     }
 
     fn register_higher_order_function(
         &mut self,
         function: Arc<HigherOrderUDF>,
     ) -> Result<Option<Arc<HigherOrderUDF>>> {
+        let higher_order_functions = Arc::make_mut(&mut self.higher_order_functions);
         function.aliases().iter().for_each(|alias| {
-            self.higher_order_functions
-                .insert(alias.clone(), Arc::clone(&function));
+            higher_order_functions.insert(alias.clone(), Arc::clone(&function));
         });
-        Ok(self
-            .higher_order_functions
-            .insert(function.name().into(), function))
+        Ok(higher_order_functions.insert(function.name().into(), function))
     }
 
     fn expr_planners(&self) -> Vec<Arc<dyn ExprPlanner>> {

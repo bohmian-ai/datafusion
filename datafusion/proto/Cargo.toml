@@ -70,6 +70,7 @@ datafusion-execution = { workspace = true }
 datafusion-expr = { workspace = true, features = ["proto"] }
 datafusion-functions-table = { workspace = true }
 datafusion-physical-expr = { workspace = true, features = ["proto"] }
+datafusion-physical-expr-adapter = { workspace = true }
 datafusion-physical-expr-common = { workspace = true, features = ["proto"] }
 datafusion-physical-plan = { workspace = true, features = ["proto"] }
 datafusion-proto-common = { workspace = true }
@@ -86,6 +87,7 @@ datafusion = { workspace = true, default-features = false, features = [
     "compression",
     "datetime_expressions",
     "nested_expressions",
+    "variant",
     "unicode_expressions",
 ] }
 datafusion-functions = { workspace = true, default-features = true }

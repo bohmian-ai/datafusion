@@ -572,6 +572,13 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         input: LogicalPlan,
         select_exprs: Vec<Expr>,
     ) -> Result<LogicalPlan> {
+        // Without an UNNEST in the select list the rewrite below returns every
+        // expression unchanged; skip its per-expression clone and walk.
+        if !select_exprs.iter().any(has_unnest_expr_recursively) {
+            return LogicalPlanBuilder::from(self.try_process_aggregate_unnest(input)?)
+                .project(select_exprs)?
+                .build();
+        }
         let RewrittenUnnestExprGroups { plan, expr_groups } = self
             .rewrite_unnest_expr_groups(
                 input,

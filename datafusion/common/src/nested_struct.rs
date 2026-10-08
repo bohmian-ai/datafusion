@@ -103,10 +103,15 @@ fn cast_struct_column(
             match source_child_opt {
                 Some(source_child_col_idx) => {
                     let source_child_col = source_struct.column(*source_child_col_idx);
+                    let source_child_col = if is_variant(target_child_field) {
+                        &with_parent_nulls(source_child_col, source_struct.nulls())?
+                    } else {
+                        source_child_col
+                    };
 
-                    let adapted_child = cast_column(
+                    let adapted_child = cast_column_to_field(
                         source_child_col,
-                        target_child_field.data_type(),
+                        target_child_field,
                         cast_options,
                     )
                     .map_err(|e| {
@@ -195,6 +200,98 @@ fn cast_union_column(
         source_union.type_ids().clone(),
         source_union.offsets().cloned(),
         children,
+    )?))
+}
+
+/// Whether `field` is declared as a Parquet Variant
+/// (`arrow.parquet.variant` extension type).
+pub fn is_variant(field: &Field) -> bool {
+    field.extension_type_name() == Some(VARIANT_EXTENSION_NAME)
+}
+
+/// The Arrow extension type name of a Parquet Variant.
+const VARIANT_EXTENSION_NAME: &str = "arrow.parquet.variant";
+
+/// Cast a column to `target`, honoring the target field's extension type.
+///
+/// A Variant target is converted from any stored Variant layout, shredded
+/// or not, by its values rather than by struct field names (see
+/// [`crate::variant`]). Every other target is cast by [`cast_column`].
+///
+/// # Errors
+///
+/// Returns the [`cast_column`] errors, and for a Variant target whose source
+/// is shredded, an error when the `variant` feature is off or the stored
+/// values are not valid Variants.
+pub fn cast_column_to_field(
+    source_col: &ArrayRef,
+    target: &Field,
+    cast_options: &CastOptions,
+) -> Result<ArrayRef> {
+    if is_variant(target) && source_col.data_type() != target.data_type() {
+        #[cfg(feature = "variant")]
+        return crate::variant::cast_to_variant_field(source_col, target, cast_options);
+        #[cfg(not(feature = "variant"))]
+        if source_col
+            .as_struct_opt()
+            .is_some_and(|source| source.column_by_name("typed_value").is_some())
+        {
+            return _plan_err!(
+                "Reading shredded Variant field '{}' requires the `variant` feature",
+                target.name()
+            );
+        }
+    }
+    cast_column(source_col, target.data_type(), cast_options)
+}
+
+/// Check that a `source` field can be cast to `target`, honoring the target
+/// field's extension type.
+///
+/// A Variant target accepts any struct with a `metadata` child, since the
+/// conversion reads values rather than matching struct fields; every other
+/// target is checked by [`validate_data_type_compatibility`].
+///
+/// # Errors
+///
+/// Returns a plan error naming the field when the cast is not possible.
+pub fn validate_field_cast_compatibility(source: &Field, target: &Field) -> Result<()> {
+    if is_variant(target) && source.data_type() != target.data_type() {
+        let Struct(children) = source.data_type() else {
+            return _plan_err!(
+                "Cannot read field '{}' of type {} as a Variant",
+                target.name(),
+                source.data_type()
+            );
+        };
+        if children.find("metadata").is_none() {
+            return _plan_err!(
+                "Cannot read field '{}' as a Variant: it has no 'metadata' child",
+                target.name()
+            );
+        }
+        return Ok(());
+    }
+    validate_data_type_compatibility(
+        target.name(),
+        source.data_type(),
+        target.data_type(),
+    )
+}
+
+/// `child` with every row null whose parent row is null.
+///
+/// A Parquet reader may leave placeholder values under a null parent; a
+/// Variant conversion must not decode them.
+fn with_parent_nulls(child: &ArrayRef, parent: Option<&NullBuffer>) -> Result<ArrayRef> {
+    let (Some(parent), Some(child_struct)) = (parent, child.as_struct_opt()) else {
+        return Ok(Arc::clone(child));
+    };
+    let (fields, columns, nulls) = child_struct.clone().into_parts();
+    Ok(Arc::new(StructArray::try_new(
+        fields,
+        columns,
+        NullBuffer::union(Some(parent), nulls.as_ref()),
     )?))
 }
 
@@ -338,11 +435,8 @@ fn cast_list_column<O: arrow::array::OffsetSizeTrait>(
     };
     let source_list = compacted_list.as_ref().unwrap_or(source_list);
 
-    let cast_values = cast_column(
-        source_list.values(),
-        target_inner_field.data_type(),
-        cast_options,
-    )?;
+    let cast_values =
+        cast_column_to_field(source_list.values(), target_inner_field, cast_options)?;
 
     let result = GenericListArray::<O>::new(
         Arc::clone(target_inner_field),
@@ -369,7 +463,7 @@ fn cast_list_view_column<O: arrow::array::OffsetSizeTrait>(
         ),
     };
 
-    let cast_values = cast_column(values, target_inner_field.data_type(), cast_options)?;
+    let cast_values = cast_column_to_field(values, target_inner_field, cast_options)?;
 
     let result = GenericListViewArray::<O>::try_new(
         Arc::clone(target_inner_field),
@@ -783,6 +877,9 @@ fn validate_field_compatibility(
     source_field: &Field,
     target_field: &Field,
 ) -> Result<()> {
+    if is_variant(target_field) {
+        return validate_field_cast_compatibility(source_field, target_field);
+    }
     if source_field.data_type() == &DataType::Null {
         // Validate that target allows nulls before returning early.
         // It is invalid to cast a NULL source field to a non-nullable target field.

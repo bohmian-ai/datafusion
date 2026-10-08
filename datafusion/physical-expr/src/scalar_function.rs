@@ -183,6 +183,27 @@ impl ScalarFunctionExpr {
         Some(access)
     }
 
+    /// Returns the index of the List argument this call selects one element
+    /// of, if the UDF declares it and every other argument is a literal. See
+    /// [`datafusion_expr::ScalarUDFImpl::list_element_access`].
+    pub fn list_element_access(&self) -> Option<usize> {
+        let literals = self
+            .args
+            .iter()
+            .map(|arg| {
+                arg.downcast_ref::<Literal>()
+                    .map(|literal| literal.value().clone())
+            })
+            .collect::<Vec<_>>();
+        let source = self.fun.list_element_access(&literals)?;
+        (source < self.args.len()
+            && literals
+                .iter()
+                .enumerate()
+                .all(|(index, literal)| index == source || literal.is_some()))
+        .then_some(source)
+    }
+
     /// Ask the UDF for input requirements against this schema, validating every
     /// argument index and struct path. Invalid declarations retain full inputs.
     /// Column names are resolved again because projection analysis can receive

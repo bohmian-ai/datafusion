@@ -38,14 +38,13 @@ use arrow::datatypes::SchemaRef;
 
 use datafusion_common::Result;
 use datafusion_physical_expr::projection::{ProjectionExprs, Projector};
-use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr_adapter::replace_columns_with_literals;
 
 use parquet::arrow::ProjectionMask;
 use parquet::schema::types::SchemaDescriptor;
 
 use crate::opener::{VirtualColumnsState, append_fields};
-use crate::projection_read_plan::build_projection_read_plan;
+use crate::projection_read_plan::{build_projection_read_plan, rebase_onto_read};
 
 /// Per-file decoder projection: the [`ProjectionMask`] installed on the
 /// parquet decoder, plus the per-batch transform that maps the decoder's
@@ -115,9 +114,9 @@ impl DecoderProjection {
 
         // Rebase the projection onto the decoder's stream schema (column
         // indices change because the decoder yields only the masked columns).
-        let rebased_projection = projection
-            .clone()
-            .try_map_exprs(|expr| reassign_expr_columns(expr, &stream_schema))?;
+        let rebased_projection = projection.clone().try_map_exprs(|expr| {
+            rebase_onto_read(expr, &stream_schema, physical_file_schema)
+        })?;
         let projector = rebased_projection.make_projector(&stream_schema)?;
 
         // Compare against the projector's *output* schema rather than the

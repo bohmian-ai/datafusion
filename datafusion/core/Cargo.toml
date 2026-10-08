@@ -76,6 +76,12 @@ default = [
     "sql",
 ]
 encoding_expressions = ["datafusion-functions/encoding_expressions"]
+# Parquet Variant support: reads shredded Variant columns as the table's Variant.
+variant = [
+    "datafusion-common/variant",
+    "dep:datafusion-functions-variant",
+    "parquet?/variant_experimental",
+]
 # Used for testing ONLY: causes all values to hash to the same value (test for collisions)
 force_hash_collisions = ["datafusion-physical-plan/force_hash_collisions", "datafusion-common/force_hash_collisions"]
 math_expressions = ["datafusion-functions/math_expressions"]
@@ -107,6 +113,7 @@ serde = [
 sql = [
     "datafusion-common/sql",
     "datafusion-functions-nested?/sql",
+    "datafusion-functions-variant?/sql",
     "datafusion-sql",
     "sqlparser",
 ]
@@ -139,6 +146,7 @@ datafusion-expr-common = { workspace = true }
 datafusion-functions = { workspace = true }
 datafusion-functions-aggregate = { workspace = true }
 datafusion-functions-nested = { workspace = true, default-features = false, optional = true }
+datafusion-functions-variant = { workspace = true, default-features = false, optional = true }
 datafusion-functions-table = { workspace = true }
 datafusion-functions-window = { workspace = true }
 datafusion-optimizer = { workspace = true }
@@ -167,6 +175,7 @@ uuid = { workspace = true, features = ["v4", "js"] }
 zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
+parquet-variant-compute = { workspace = true }
 async-trait = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio", "async_futures"] }
 ctor = { workspace = true }
@@ -180,6 +189,7 @@ bytes = { workspace = true }
 env_logger = { workspace = true }
 glob = { workspace = true }
 insta = { workspace = true }
+mimalloc = { version = "0.1", default-features = false }
 half = { workspace = true }
 rand = { workspace = true, features = ["small_rng"] }
 rand_distr = "0.5"
@@ -274,6 +284,11 @@ required-features = ["parquet"]
 harness = false
 name = "parquet_struct_query"
 required-features = ["parquet"]
+
+[[bench]]
+harness = false
+name = "parquet_variant_query"
+required-features = ["parquet", "variant"]
 
 [[bench]]
 harness = false

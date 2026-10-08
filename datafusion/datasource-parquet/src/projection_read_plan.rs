@@ -35,8 +35,10 @@ use parquet::arrow::ProjectionMask;
 use parquet::schema::types::SchemaDescriptor;
 
 use datafusion_common::Result;
-use datafusion_common::nested_struct::requires_nested_struct_cast;
-use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
+use datafusion_common::nested_struct::{is_variant, requires_nested_struct_cast};
+use datafusion_common::tree_node::{
+    Transformed, TransformedResult, TreeNode, TreeNodeRecursion, TreeNodeVisitor,
+};
 use datafusion_functions::core::file_row_index::FileRowIndexFunc;
 use datafusion_physical_expr::expressions::{CastExpr, Column};
 use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
@@ -386,18 +388,7 @@ impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
     type Node = Arc<dyn PhysicalExpr>;
 
     fn f_down(&mut self, node: &Self::Node) -> Result<TreeNodeRecursion> {
-        // Resolve capability-declaring accessors, including chains with
-        // different UDFs and argument layouts. Do not look through casts.
-        let mut source = node;
-        let mut paths = Vec::new();
-        while let Some(function) = source.downcast_ref::<ScalarFunctionExpr>() {
-            let Some(access) = function.struct_field_access() else {
-                break;
-            };
-            paths.push(access.field_path);
-            source = &function.args()[access.source_arg];
-        }
-        let field_path = paths.into_iter().rev().flatten().collect::<Vec<_>>();
+        let (source, field_path) = struct_access_chain(node);
         if !field_path.is_empty() {
             let return_type = node.data_type(self.file_schema)?;
             if let Some(recursion) =
@@ -458,9 +449,19 @@ impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
                 if let Some(requirement) =
                     requirements.iter().find(|r| r.arg_index == index)
                 {
-                    if let Some(column) = argument.downcast_ref::<Column>() {
+                    // Requirements on a Struct field chain apply below its path.
+                    let (source, prefix) = struct_access_chain(argument);
+                    if let Some(column) = source.downcast_ref::<Column>()
+                        && self.file_schema.field_with_name(column.name()).is_ok_and(
+                            |root| {
+                                resolve_struct_field_type(root.data_type(), &prefix)
+                                    .is_some()
+                            },
+                        )
+                    {
                         for path in &requirement.field_paths {
-                            self.check_struct_field_column(column.name(), path.clone());
+                            let path = prefix.iter().chain(path).cloned().collect();
+                            self.check_struct_field_column(column.name(), path);
                         }
                         continue;
                     }
@@ -469,6 +470,7 @@ impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
                     // cast; retain its entire target and evaluate it unchanged.
                     if self.allow_struct_casts
                         && let Some(cast) = argument.downcast_ref::<CastExpr>()
+                        && !is_variant(cast.target_field())
                         && let Some(column) = cast.expr().downcast_ref::<Column>()
                         && let Ok(root_index) = self.file_schema.index_of(column.name())
                         && matches!(
@@ -499,6 +501,7 @@ impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
         // (see `crate::nested_schema_pruning`).
         if self.collect_cast_accesses
             && let Some(cast) = node.downcast_ref::<CastExpr>()
+            && !is_variant(cast.target_field())
             && let Some(column) = cast.expr().downcast_ref::<Column>()
             && let Ok(idx) = self.file_schema.index_of(column.name())
             && requires_nested_struct_cast(
@@ -530,6 +533,73 @@ impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
 
         Ok(TreeNodeRecursion::Continue)
     }
+}
+
+/// Rebase `expr` onto `read_schema`, the schema a read plan decodes.
+///
+/// Column indices are reassigned. When the read narrowed a Struct below what
+/// `file_schema` holds (for example `s.v` under `variant_get(s['v'], 'k')`,
+/// which declared only some of `s.v`'s leaves), a function returning a
+/// nested type is rebuilt so its return field matches what it produces over
+/// the narrowed input. Reads that narrow nothing are only reassigned.
+///
+/// # Errors
+///
+/// Returns an error when a column cannot be reassigned.
+pub(crate) fn rebase_onto_read(
+    expr: Arc<dyn PhysicalExpr>,
+    read_schema: &Schema,
+    file_schema: &Schema,
+) -> Result<Arc<dyn PhysicalExpr>> {
+    let expr = reassign_expr_columns(expr, read_schema)?;
+    let narrowed = read_schema.fields().iter().any(|field| {
+        file_schema
+            .field_with_name(field.name())
+            .is_ok_and(|file| file.data_type() != field.data_type())
+    });
+    if !narrowed {
+        return Ok(expr);
+    }
+    expr.transform_up(|expr| {
+        let Some(function) = expr.downcast_ref::<ScalarFunctionExpr>() else {
+            return Ok(Transformed::no(expr));
+        };
+        if !function.return_type().is_nested() {
+            return Ok(Transformed::no(expr));
+        }
+        let Ok(rebuilt) = ScalarFunctionExpr::try_new(
+            Arc::new(function.fun().clone()),
+            function.args().to_vec(),
+            read_schema,
+            Arc::new(function.config_options().clone()),
+        ) else {
+            return Ok(Transformed::no(expr));
+        };
+        if rebuilt.return_type() == function.return_type() {
+            return Ok(Transformed::no(expr));
+        }
+        Ok(Transformed::yes(Arc::new(rebuilt) as Arc<dyn PhysicalExpr>))
+    })
+    .data()
+}
+
+/// Follow capability-declaring Struct accessors, including chains with
+/// different UDFs and argument layouts, to their source. Returns the source
+/// and the combined field path, empty when `expr` is no accessor. Does not
+/// look through casts.
+fn struct_access_chain(
+    expr: &Arc<dyn PhysicalExpr>,
+) -> (&Arc<dyn PhysicalExpr>, Vec<String>) {
+    let mut source = expr;
+    let mut paths = Vec::new();
+    while let Some(function) = source.downcast_ref::<ScalarFunctionExpr>() {
+        let Some(access) = function.struct_field_access() else {
+            break;
+        };
+        paths.push(access.field_path);
+        source = &function.args()[access.source_arg];
+    }
+    (source, paths.into_iter().rev().flatten().collect())
 }
 
 /// Resolve literal names through structs, rejecting missing or ambiguous fields.
@@ -1243,6 +1313,7 @@ mod test {
         datafusion_expr::InputFieldRequirement {
             arg_index: 1,
             field_paths: vec![vec!["value".into()], vec!["label".into()]],
+            accepts_any_layout: false,
         }
     }
 
@@ -1278,6 +1349,7 @@ mod test {
                 Some(vec![datafusion_expr::InputFieldRequirement {
                     arg_index: 0,
                     field_paths: vec![self.0.clone()],
+                    accepts_any_layout: false,
                 }])
             }
 
@@ -1391,6 +1463,7 @@ mod test {
                 datafusion_expr::InputFieldRequirement {
                     arg_index: 0,
                     field_paths: vec![vec![]],
+                    accepts_any_layout: false,
                 },
                 score_requirement(),
             ]),

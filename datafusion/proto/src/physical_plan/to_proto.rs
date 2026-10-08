@@ -291,6 +291,7 @@ pub fn serialize_physical_expr_with_converter(
     if let Some(expr) = expr.downcast_ref::<ScalarFunctionExpr>() {
         let mut buf = Vec::new();
         codec.try_encode_udf(expr.fun(), &mut buf)?;
+        let return_field = expr.return_field(&Schema::empty())?;
         Ok(protobuf::PhysicalExprNode {
             expr_id,
             expr_type: Some(protobuf::physical_expr_node::ExprType::ScalarUdf(
@@ -300,10 +301,8 @@ pub fn serialize_physical_expr_with_converter(
                     fun_definition: (!buf.is_empty()).then_some(buf),
                     return_type: Some(expr.return_type().try_into()?),
                     nullable: expr.nullable(),
-                    return_field_name: expr
-                        .return_field(&Schema::empty())?
-                        .name()
-                        .to_string(),
+                    return_field_name: return_field.name().to_string(),
+                    return_field_metadata: return_field.metadata().into(),
                 },
             )),
         })

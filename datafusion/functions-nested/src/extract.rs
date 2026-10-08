@@ -22,10 +22,10 @@ use arrow::array::{
     MutableArrayData, NullArray, OffsetSizeTrait,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
-use arrow::datatypes::DataType;
 use arrow::datatypes::DataType::{
     FixedSizeList, LargeList, LargeListView, List, ListView, Null,
 };
+use arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion_common::cast::as_large_list_array;
 use datafusion_common::cast::as_list_array;
 use datafusion_common::cast::{
@@ -34,15 +34,16 @@ use datafusion_common::cast::{
 use datafusion_common::internal_err;
 use datafusion_common::utils::ListCoercion;
 use datafusion_common::{
-    Result, exec_datafusion_err, exec_err, internal_datafusion_err, plan_err,
-    utils::take_function_args,
+    Result, ScalarValue, exec_datafusion_err, exec_err, internal_datafusion_err,
+    plan_err, utils::take_function_args,
 };
 use datafusion_expr::{
-    ArrayFunctionArgument, ArrayFunctionSignature, Expr, ScalarFunctionArgs,
-    TypeSignature,
+    ArrayFunctionArgument, ArrayFunctionSignature, Expr, ReturnFieldArgs,
+    ScalarFunctionArgs, TypeSignature,
 };
 use datafusion_expr::{
-    ColumnarValue, Documentation, ScalarUDFImpl, Signature, Volatility,
+    ColumnarValue, Documentation, ExpressionPlacement, ScalarUDFImpl, Signature,
+    Volatility,
 };
 use datafusion_macros::user_doc;
 use std::sync::Arc;
@@ -159,8 +160,48 @@ impl ScalarUDFImpl for ArrayElement {
         }
     }
 
+    /// The element keeps its field metadata (for example an extension type);
+    /// it is always nullable because the index may be out of range.
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
+        let list = args.arg_fields[0].data_type();
+        let field = Field::new(
+            self.name(),
+            self.return_type(std::slice::from_ref(list))?,
+            true,
+        );
+        Ok(Arc::new(match list {
+            List(element) | LargeList(element) => {
+                field.with_metadata(element.metadata().clone())
+            }
+            _ => field,
+        }))
+    }
+
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         make_scalar_function(array_element_inner)(&args.args)
+    }
+
+    /// A literal index selects one element of the list, unchanged, or null.
+    fn list_element_access(&self, literal_args: &[Option<ScalarValue>]) -> Option<usize> {
+        match literal_args {
+            [_, Some(index)] if index.data_type().is_integer() && !index.is_null() => {
+                Some(0)
+            }
+            _ => None,
+        }
+    }
+
+    /// Like `get_field`, a literal-index lookup on a column (or on another
+    /// leaf-pushable expression) is cheap and narrows its input, so it moves
+    /// toward the scan.
+    fn placement(&self, args: &[ExpressionPlacement]) -> ExpressionPlacement {
+        match args {
+            [
+                ExpressionPlacement::Column | ExpressionPlacement::MoveTowardsLeafNodes,
+                ExpressionPlacement::Literal,
+            ] => ExpressionPlacement::MoveTowardsLeafNodes,
+            _ => ExpressionPlacement::KeepInPlace,
+        }
     }
 
     fn aliases(&self) -> &[String] {

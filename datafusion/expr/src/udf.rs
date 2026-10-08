@@ -79,6 +79,12 @@ pub struct InputFieldRequirement {
     /// the entire argument; a path ending at a nested field selects its whole
     /// subtree. Names are literal components, including any dots.
     pub field_paths: Vec<Vec<String>>,
+    /// The function accepts this argument in any storage layout of its
+    /// extension type (for example a shredded Variant) and gives the same
+    /// result. A schema adapter may then pass the file's field instead of
+    /// converting it to the table's layout; `field_paths` refer to the layout
+    /// the function is given.
+    pub accepts_any_layout: bool,
 }
 
 /// Logical representation of a Scalar User Defined Function.
@@ -350,6 +356,14 @@ impl ScalarUDF {
         literal_args: &[Option<ScalarValue>],
     ) -> Option<StructFieldAccess> {
         self.inner.struct_field_access(literal_args)
+    }
+
+    /// See [`ScalarUDFImpl::list_element_access`].
+    pub fn list_element_access(
+        &self,
+        literal_args: &[Option<ScalarValue>],
+    ) -> Option<usize> {
+        self.inner.list_element_access(literal_args)
     }
 
     /// See [`ScalarUDFImpl::required_input_fields`].
@@ -1083,6 +1097,27 @@ pub trait ScalarUDFImpl: Debug + DynEq + DynHash + Send + Sync + Any {
         None
     }
 
+    /// Describe this call as selecting one element of a List argument.
+    ///
+    /// `literal_args[i]` contains argument `i` when it is a known literal.
+    /// Return the index of the List argument when the call returns one of its
+    /// elements unchanged, or null, and every other argument is a literal.
+    /// The element is returned with its type, metadata, and nested nulls; the
+    /// function must work with element structs narrowed to some of their
+    /// fields, resolving fields by name.
+    ///
+    /// Readers use this to decode only the element fields that consumers of
+    /// the result need, and schema adapters to narrow a List cast to its
+    /// element. It says nothing about which element is selected, so it does
+    /// not justify pruning by the List's leaf statistics. Return `None` when
+    /// these guarantees do not hold.
+    fn list_element_access(
+        &self,
+        _literal_args: &[Option<ScalarValue>],
+    ) -> Option<usize> {
+        None
+    }
+
     /// Describe which nested input fields suffice to evaluate this call.
     ///
     /// The supplied argument fields describe the schema at the point of use,
@@ -1099,7 +1134,9 @@ pub trait ScalarUDFImpl: Debug + DynEq + DynHash + Send + Sync + Any {
     /// accept any union of these requirements with other consumers' fields.
     /// Required metadata, fallback values and fields needed for validation must
     /// all be included. The declaration does not permit skipping evaluation of
-    /// argument expressions or their conversions.
+    /// argument expressions or their conversions, except a layout conversion
+    /// of an argument declared with
+    /// [`InputFieldRequirement::accepts_any_layout`].
     ///
     /// Readers may prune inputs and still evaluate the original function. This
     /// does not assert that its output equals a field (see
@@ -1283,6 +1320,10 @@ impl ScalarUDFImpl for AliasedScalarUDFImpl {
         literal_args: &[Option<ScalarValue>],
     ) -> Option<StructFieldAccess> {
         self.inner.struct_field_access(literal_args)
+    }
+
+    fn list_element_access(&self, literal_args: &[Option<ScalarValue>]) -> Option<usize> {
+        self.inner.list_element_access(literal_args)
     }
 
     fn struct_field_mapping(

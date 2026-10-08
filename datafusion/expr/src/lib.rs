@@ -128,7 +128,7 @@ pub use function::{
 pub use higher_order_function::{
     HigherOrderFunctionArgs, HigherOrderReturnFieldArgs, HigherOrderSignature,
     HigherOrderTypeSignature, HigherOrderUDF, HigherOrderUDFImpl, LambdaArgument,
-    LambdaParametersProgress, ValueOrLambda,
+    LambdaParametersProgress, ListElementLambda, ValueOrLambda,
 };
 pub use literal::{
     Literal, TimestampLiteral, lit, lit_timestamp_nano, lit_with_metadata,

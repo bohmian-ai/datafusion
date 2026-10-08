@@ -95,6 +95,8 @@ impl SessionStateDefaults {
             Arc::new(functions::datetime::planner::DatetimeFunctionPlanner),
             #[cfg(feature = "unicode_expressions")]
             Arc::new(functions::unicode::planner::UnicodeFunctionPlanner),
+            #[cfg(all(feature = "variant", feature = "sql"))]
+            Arc::new(datafusion_functions_variant::planner::VariantFunctionPlanner),
             Arc::new(functions_aggregate::planner::AggregateFunctionPlanner),
             Arc::new(functions_window::planner::WindowFunctionPlanner),
         ];
@@ -104,11 +106,18 @@ impl SessionStateDefaults {
 
     /// returns the list of default [`ScalarUDF`]s
     pub fn default_scalar_functions() -> Vec<Arc<ScalarUDF>> {
-        #[cfg_attr(not(feature = "nested_expressions"), expect(unused_mut))]
+        #[cfg_attr(
+            not(any(feature = "nested_expressions", feature = "variant")),
+            expect(unused_mut)
+        )]
         let mut functions: Vec<Arc<ScalarUDF>> = functions::all_default_functions();
 
         #[cfg(feature = "nested_expressions")]
         functions.append(&mut functions_nested::all_default_nested_functions());
+
+        #[cfg(feature = "variant")]
+        functions
+            .append(&mut datafusion_functions_variant::all_default_variant_functions());
 
         functions
     }

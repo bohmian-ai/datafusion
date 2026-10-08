@@ -37,6 +37,7 @@ members = [
     "datafusion/functions-aggregate-common",
     "datafusion/functions-table",
     "datafusion/functions-nested",
+    "datafusion/functions-variant",
     "datafusion/functions-window",
     "datafusion/functions-window-common",
     "datafusion/optimizer",
@@ -143,6 +144,7 @@ datafusion-functions = { path = "datafusion/functions", version = "55.1.0" }
 datafusion-functions-aggregate = { path = "datafusion/functions-aggregate", version = "55.1.0" }
 datafusion-functions-aggregate-common = { path = "datafusion/functions-aggregate-common", version = "55.1.0" }
 datafusion-functions-nested = { path = "datafusion/functions-nested", version = "55.1.0", default-features = false }
+datafusion-functions-variant = { path = "datafusion/functions-variant", version = "55.1.0", default-features = false }
 datafusion-functions-table = { path = "datafusion/functions-table", version = "55.1.0" }
 datafusion-functions-window = { path = "datafusion/functions-window", version = "55.1.0" }
 datafusion-functions-window-common = { path = "datafusion/functions-window-common", version = "55.1.0" }
@@ -186,6 +188,9 @@ parquet = { version = "60.0.0", default-features = false, features = [
     "async",
     "object_store",
 ] }
+parquet-variant = "60.0.0"
+parquet-variant-compute = "60.0.0"
+parquet-variant-json = "60.0.0"
 pbjson = { version = "0.9.0" }
 pbjson-types = "0.9"
 percent-encoding = "2.3"
@@ -406,3 +411,27 @@ debug = false
 debug-assertions = false
 strip = "debuginfo"
 incremental = false
+
+# Local arrow-rs 60.0.0 with the unshred_variant pre-size fix; never push.
+[patch.crates-io]
+arrow = { path = "../arrow-rs/arrow" }
+arrow-arith = { path = "../arrow-rs/arrow-arith" }
+arrow-array = { path = "../arrow-rs/arrow-array" }
+arrow-avro = { path = "../arrow-rs/arrow-avro" }
+arrow-buffer = { path = "../arrow-rs/arrow-buffer" }
+arrow-cast = { path = "../arrow-rs/arrow-cast" }
+arrow-cmp = { path = "../arrow-rs/arrow-cmp" }
+arrow-csv = { path = "../arrow-rs/arrow-csv" }
+arrow-data = { path = "../arrow-rs/arrow-data" }
+arrow-flight = { path = "../arrow-rs/arrow-flight" }
+arrow-ipc = { path = "../arrow-rs/arrow-ipc" }
+arrow-json = { path = "../arrow-rs/arrow-json" }
+arrow-ord = { path = "../arrow-rs/arrow-ord" }
+arrow-row = { path = "../arrow-rs/arrow-row" }
+arrow-schema = { path = "../arrow-rs/arrow-schema" }
+arrow-select = { path = "../arrow-rs/arrow-select" }
+arrow-string = { path = "../arrow-rs/arrow-string" }
+parquet = { path = "../arrow-rs/parquet" }
+parquet-variant = { path = "../arrow-rs/parquet-variant" }
+parquet-variant-compute = { path = "../arrow-rs/parquet-variant-compute" }
+parquet-variant-json = { path = "../arrow-rs/parquet-variant-json" }

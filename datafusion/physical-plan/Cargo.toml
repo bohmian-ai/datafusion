@@ -46,6 +46,7 @@ tokio_coop_fallback = []
 # physical expressions defined in this crate (e.g. `HashExpr`). Off by
 # default so consumers that never serialize plans pay nothing.
 proto = [
+    "dep:datafusion-physical-expr-adapter",
     "dep:datafusion-proto-models",
     "dep:datafusion-proto-common",
     "datafusion-physical-expr/proto",
@@ -75,6 +76,7 @@ datafusion-functions = { workspace = true }
 datafusion-functions-aggregate-common = { workspace = true }
 datafusion-functions-window-common = { workspace = true }
 datafusion-physical-expr = { workspace = true, default-features = true }
+datafusion-physical-expr-adapter = { workspace = true, optional = true }
 datafusion-physical-expr-common = { workspace = true }
 datafusion-proto-common = { workspace = true, optional = true }
 datafusion-proto-models = { workspace = true, optional = true }

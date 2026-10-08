@@ -64,6 +64,8 @@ pub mod test_util;
 pub mod tree_node;
 pub mod types;
 pub mod utils;
+#[cfg(feature = "variant")]
+pub mod variant;
 
 /// Reexport arrow crate
 pub use arrow;

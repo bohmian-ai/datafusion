@@ -60,6 +60,8 @@ mod schema;
 mod schema_coercion;
 mod string_in_list_pruning;
 mod utils;
+#[cfg(feature = "variant")]
+mod variant;
 
 #[cfg(test)]
 #[ctor::ctor(unsafe)]

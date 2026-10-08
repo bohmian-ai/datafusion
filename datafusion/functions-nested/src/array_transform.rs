@@ -28,8 +28,8 @@ use datafusion_common::{
 };
 use datafusion_expr::{
     ColumnarValue, Documentation, HigherOrderFunctionArgs, HigherOrderReturnFieldArgs,
-    HigherOrderSignature, HigherOrderUDFImpl, LambdaParametersProgress, ValueOrLambda,
-    Volatility,
+    HigherOrderSignature, HigherOrderUDFImpl, LambdaParametersProgress,
+    ListElementLambda, ValueOrLambda, Volatility,
 };
 use datafusion_macros::user_doc;
 use std::sync::Arc;
@@ -115,6 +115,16 @@ impl HigherOrderUDFImpl for ArrayTransform {
         fields: &[ValueOrLambda<FieldRef, Option<FieldRef>>],
     ) -> Result<LambdaParametersProgress> {
         single_list_lambda_parameters(self.name(), fields)
+    }
+
+    /// The lambda's first parameter is each element of the list, which the
+    /// function reads only through the lambda.
+    fn list_element_lambda(&self) -> Option<ListElementLambda> {
+        Some(ListElementLambda {
+            list_arg: 0,
+            lambda_arg: 1,
+            parameter: 0,
+        })
     }
 
     fn return_field_from_args(

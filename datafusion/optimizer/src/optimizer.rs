@@ -615,13 +615,19 @@ impl Optimizer {
         let options = config.options();
         let mut new_plan = plan;
 
-        let mut previous_plans = HashSet::with_capacity(16);
-        previous_plans.insert(LogicalPlanSignature::new(&new_plan));
+        // Signatures only detect a pass that changed nothing so the next one
+        // can be skipped; with a single pass there is no next one to skip.
+        let max_passes = options.optimizer.max_passes;
+        let mut previous_plans = HashSet::new();
+        if max_passes > 1 {
+            previous_plans.reserve(16);
+            previous_plans.insert(LogicalPlanSignature::new(&new_plan));
+        }
 
         let starting_schema = Arc::clone(new_plan.schema());
 
         let mut i = 0;
-        while i < options.optimizer.max_passes {
+        while i < max_passes {
             log_plan(&format!("Optimizer input (pass {i})"), &new_plan);
 
             // Track subquery presence across the pass. Refresh after changed
@@ -742,6 +748,9 @@ impl Optimizer {
             }
             log_plan(&format!("Optimized plan (pass {i})"), &new_plan);
 
+            if i + 1 == max_passes {
+                break;
+            }
             // HashSet::insert returns, whether the value was newly inserted.
             let plan_is_fresh =
                 previous_plans.insert(LogicalPlanSignature::new(&new_plan));

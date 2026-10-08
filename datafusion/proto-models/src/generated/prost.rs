@@ -1716,6 +1716,12 @@ pub struct PhysicalScalarUdfNode {
     pub nullable: bool,
     #[prost(string, tag = "6")]
     pub return_field_name: ::prost::alloc::string::String,
+    /// Return field metadata, such as an Arrow extension type.
+    #[prost(map = "string, string", tag = "7")]
+    pub return_field_metadata: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PhysicalHigherOrderUdfNode {
@@ -2015,6 +2021,10 @@ pub struct FileScanExecConf {
     /// legacy behavior of deriving this from output_ordering.
     #[prost(bool, optional, tag = "17")]
     pub preserve_order: ::core::option::Option<bool>,
+    /// A non-default `PhysicalExprAdapterFactory`, serialized by the
+    /// `PhysicalExtensionCodec`. Absent means the default adapter.
+    #[prost(bytes = "vec", optional, tag = "18")]
+    pub expr_adapter_factory: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ParquetScanExecNode {

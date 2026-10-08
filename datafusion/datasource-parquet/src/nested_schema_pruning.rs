@@ -84,6 +84,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, FieldRef, Fields};
+use datafusion_common::nested_struct::is_variant;
 
 /// The single logical child type one level of container nesting wraps. `Map`
 /// and `RunEndEncoded` are included because [`count_leaves`] and
@@ -234,13 +235,8 @@ fn clip_type(
                         return None;
                     };
                     let before = kept.len();
-                    let pruned = clip_type(
-                        pc.data_type(),
-                        tc.data_type(),
-                        next_leaf,
-                        kept,
-                        unclippable,
-                    );
+                    let pruned =
+                        clip_field(pc.data_type(), tc, next_leaf, kept, unclippable);
                     if kept.len() == before {
                         // This child matched by name but kept no leaves at
                         // all, which only happens when a nested struct level
@@ -261,56 +257,31 @@ fn clip_type(
             DataType::Struct(kept_children)
         }
         (DataType::List(p_item), DataType::List(t_item)) => {
-            let pruned = clip_type(
-                p_item.data_type(),
-                t_item.data_type(),
-                next_leaf,
-                kept,
-                unclippable,
-            );
+            let pruned =
+                clip_field(p_item.data_type(), t_item, next_leaf, kept, unclippable);
             DataType::List(field_with_type(p_item, pruned))
         }
         (DataType::LargeList(p_item), DataType::LargeList(t_item)) => {
-            let pruned = clip_type(
-                p_item.data_type(),
-                t_item.data_type(),
-                next_leaf,
-                kept,
-                unclippable,
-            );
+            let pruned =
+                clip_field(p_item.data_type(), t_item, next_leaf, kept, unclippable);
             DataType::LargeList(field_with_type(p_item, pruned))
         }
         (DataType::ListView(p_item), DataType::ListView(t_item)) => {
-            let pruned = clip_type(
-                p_item.data_type(),
-                t_item.data_type(),
-                next_leaf,
-                kept,
-                unclippable,
-            );
+            let pruned =
+                clip_field(p_item.data_type(), t_item, next_leaf, kept, unclippable);
             DataType::ListView(field_with_type(p_item, pruned))
         }
         (DataType::LargeListView(p_item), DataType::LargeListView(t_item)) => {
-            let pruned = clip_type(
-                p_item.data_type(),
-                t_item.data_type(),
-                next_leaf,
-                kept,
-                unclippable,
-            );
+            let pruned =
+                clip_field(p_item.data_type(), t_item, next_leaf, kept, unclippable);
             DataType::LargeListView(field_with_type(p_item, pruned))
         }
         (
             DataType::FixedSizeList(p_item, p_size),
             DataType::FixedSizeList(t_item, t_size),
         ) if p_size == t_size => {
-            let pruned = clip_type(
-                p_item.data_type(),
-                t_item.data_type(),
-                next_leaf,
-                kept,
-                unclippable,
-            );
+            let pruned =
+                clip_field(p_item.data_type(), t_item, next_leaf, kept, unclippable);
             DataType::FixedSizeList(field_with_type(p_item, pruned), *p_size)
         }
         (DataType::Dictionary(p_key, p_value), DataType::Dictionary(_, t_value)) => {
@@ -320,6 +291,24 @@ fn clip_type(
         // All other shapes are opaque and kept wholesale; see the module docs.
         _ => keep_all_leaves(physical, next_leaf, kept),
     }
+}
+
+/// [`clip_type`] for a child whose target is `target`.
+///
+/// A Variant target keeps every leaf: its conversion reads values from
+/// `typed_value` and residual `value` children the target type does not
+/// name (see `datafusion_common::variant`).
+fn clip_field(
+    physical: &DataType,
+    target: &Field,
+    next_leaf: &mut usize,
+    kept: &mut Vec<usize>,
+    unclippable: &mut bool,
+) -> DataType {
+    if is_variant(target) {
+        return keep_all_leaves(physical, next_leaf, kept);
+    }
+    clip_type(physical, target.data_type(), next_leaf, kept, unclippable)
 }
 
 /// Rebuilds one physical type subtree for `kept` leaf offsets.

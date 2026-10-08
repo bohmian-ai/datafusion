@@ -60,7 +60,7 @@ use datafusion_common::{
 use datafusion_datasource::{PartitionedFile, TableSchema};
 use datafusion_physical_expr::expressions::{Column, DynamicFilterTracking, Literal};
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
-use datafusion_physical_expr::utils::collect_columns;
+use datafusion_physical_expr::utils::{collect_columns, split_conjunction};
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
@@ -885,6 +885,7 @@ impl ParquetMorselizer {
                 &partitioned_file,
                 predicate_creation_errors.clone(),
             )
+            .map(|pruner| pruner.with_max_in_list_size(self.max_in_list_size))
         });
 
         let byte_progress = ByteProgress::new(
@@ -1155,22 +1156,41 @@ impl MetadataLoadedParquetOpen {
             prepared.stats_prove_unsatisfiable = false;
         }
 
-        // Build predicates for this specific file
-        let pruning_predicate = build_pruning_predicates(
-            prepared.predicate.as_ref(),
-            &physical_file_schema,
-            &prepared.predicate_creation_errors,
-            prepared.max_in_list_size,
-        );
+        // Build predicates for this specific file. The file pruner already
+        // built one from the same predicate when nothing changed it since;
+        // reuse that rather than building it again.
+        let pruning_predicate = prepared
+            .predicate
+            .as_ref()
+            .zip(prepared.file_pruner.as_ref())
+            .and_then(|(predicate, pruner)| {
+                pruner.reusable_pruning_predicate(predicate, &physical_file_schema)
+            })
+            .unwrap_or_else(|| {
+                build_pruning_predicates(
+                    prepared.predicate.as_ref(),
+                    &physical_file_schema,
+                    &prepared.predicate_creation_errors,
+                    prepared.max_in_list_size,
+                )
+            });
 
-        // Only build page pruning predicate if page index is enabled
+        // Only build page pruning predicate if page index is enabled. A
+        // single-conjunct predicate's page filter is the row-group pruning
+        // predicate above, so it is reused instead of built again.
         let page_pruning_predicate = if prepared.enable_page_index {
             prepared.predicate.as_ref().and_then(|predicate| {
-                let p = build_page_pruning_predicate(
-                    predicate,
-                    &physical_file_schema,
-                    prepared.max_in_list_size,
-                );
+                let p = if split_conjunction(predicate).len() == 1 {
+                    Arc::new(PagePruningAccessPlanFilter::from_single_conjunct(
+                        pruning_predicate.as_deref(),
+                    ))
+                } else {
+                    build_page_pruning_predicate(
+                        predicate,
+                        &physical_file_schema,
+                        prepared.max_in_list_size,
+                    )
+                };
                 (p.filter_number() > 0).then_some(p)
             })
         } else {

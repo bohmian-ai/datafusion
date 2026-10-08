@@ -289,6 +289,7 @@ mod tests {
             Some(vec![InputFieldRequirement {
                 arg_index: 0,
                 field_paths: vec![self.path.clone()],
+                accepts_any_layout: false,
             }])
         }
 

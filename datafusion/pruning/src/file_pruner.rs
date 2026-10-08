@@ -27,7 +27,7 @@ use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_plan::metrics::Count;
 use log::debug;
 
-use crate::build_pruning_predicate;
+use crate::{MAX_IN_LIST_SIZE, PruningPredicate, PruningPredicateBuilder};
 
 /// Prune based on file-level statistics.
 ///
@@ -47,6 +47,13 @@ pub struct FilePruner {
     file_schema: SchemaRef,
     file_stats_pruning: PrunableStatistics,
     predicate_creation_errors: Count,
+    /// `IN (...)` rewrite cap, matching the row-group and page pruning
+    /// predicates built later for the same file so the first build can be
+    /// reused for them (see [`Self::reusable_pruning_predicate`]).
+    max_in_list_size: usize,
+    /// The result of the last pruning predicate build, kept so the scan can
+    /// reuse it instead of building the same predicate again per file.
+    built: Option<Option<Arc<PruningPredicate>>>,
 }
 
 impl FilePruner {
@@ -112,7 +119,35 @@ impl FilePruner {
             file_schema: Arc::clone(file_schema),
             file_stats_pruning,
             predicate_creation_errors,
+            max_in_list_size: MAX_IN_LIST_SIZE,
+            built: None,
         })
+    }
+
+    /// Sets the `IN (...)` rewrite cap used to build the pruning predicate.
+    /// Pass the cap the scan uses for row-group pruning so the build can be
+    /// shared with it.
+    pub fn with_max_in_list_size(mut self, max_in_list_size: usize) -> Self {
+        self.max_in_list_size = max_in_list_size;
+        self
+    }
+
+    /// Returns the pruning predicate the last [`Self::should_prune`] built, when
+    /// building one from `predicate` against `schema` would produce the same
+    /// thing: `predicate` is the very expression this pruner holds, `schema`
+    /// equals its file schema, and no dynamic filter inside it can still move.
+    ///
+    /// The outer `None` means "not reusable, build it yourself"; the inner
+    /// `None` means the build found nothing to prune with.
+    pub fn reusable_pruning_predicate(
+        &self,
+        predicate: &Arc<dyn PhysicalExpr>,
+        schema: &SchemaRef,
+    ) -> Option<Option<Arc<PruningPredicate>>> {
+        let reusable = !self.is_watching()
+            && Arc::ptr_eq(&self.predicate, predicate)
+            && (Arc::ptr_eq(&self.file_schema, schema) || self.file_schema == *schema);
+        reusable.then(|| self.built.clone()).flatten()
     }
 
     /// Returns `true` if this pruner watches a dynamic filter that can still
@@ -143,11 +178,12 @@ impl FilePruner {
         if !should_build {
             return Ok(false);
         }
-        let pruning_predicate = build_pruning_predicate(
-            Arc::clone(&self.predicate),
-            &self.file_schema,
-            &self.predicate_creation_errors,
-        );
+        let pruning_predicate = PruningPredicateBuilder::new()
+            .with_file_schema(Arc::clone(&self.file_schema))
+            .with_error_counter(&self.predicate_creation_errors)
+            .with_max_in_list_size(self.max_in_list_size)
+            .build(Arc::clone(&self.predicate));
+        self.built = Some(pruning_predicate.clone());
         let Some(pruning_predicate) = pruning_predicate else {
             return Ok(false);
         };
@@ -167,5 +203,67 @@ impl FilePruner {
         }
 
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_common::ScalarValue;
+    use datafusion_common::stats::{ColumnStatistics, Precision, Statistics};
+    use datafusion_expr::Operator;
+    use datafusion_physical_expr::expressions::{binary, col, lit};
+
+    /// A file whose single `id` column spans 1..=10, and the pruner for
+    /// `id = 5` over it.
+    fn pruner() -> (FilePruner, Arc<dyn PhysicalExpr>, SchemaRef) {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let predicate =
+            binary(col("id", &schema).unwrap(), Operator::Eq, lit(5i32), &schema)
+                .unwrap();
+        let stats = Statistics {
+            num_rows: Precision::Exact(10),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![
+                ColumnStatistics::new_unknown()
+                    .with_min_value(Precision::Exact(ScalarValue::Int32(Some(1))))
+                    .with_max_value(Precision::Exact(ScalarValue::Int32(Some(10)))),
+            ],
+        };
+        let file = PartitionedFile::new("f.parquet", 1).with_statistics(Arc::new(stats));
+        let pruner =
+            FilePruner::try_new(Arc::clone(&predicate), &schema, &file, Count::new())
+                .unwrap();
+        (pruner, predicate, schema)
+    }
+
+    #[test]
+    fn reuses_the_build_only_for_the_same_predicate_and_schema() {
+        let (mut pruner, predicate, schema) = pruner();
+        assert!(pruner.reusable_pruning_predicate(&predicate, &schema).is_none());
+
+        assert!(!pruner.should_prune().unwrap());
+        let reused = pruner.reusable_pruning_predicate(&predicate, &schema);
+        assert!(matches!(reused, Some(Some(_))));
+
+        let equal_schema = Arc::new(schema.as_ref().clone());
+        assert!(
+            pruner
+                .reusable_pruning_predicate(&predicate, &equal_schema)
+                .is_some()
+        );
+
+        let other = binary(col("id", &schema).unwrap(), Operator::Eq, lit(5i32), &schema)
+            .unwrap();
+        assert!(pruner.reusable_pruning_predicate(&other, &schema).is_none());
+
+        let other_schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        assert!(
+            pruner
+                .reusable_pruning_predicate(&predicate, &other_schema)
+                .is_none()
+        );
     }
 }

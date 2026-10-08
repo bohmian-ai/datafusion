@@ -571,3 +571,13 @@ async fn roundtrip_async_func_exec() -> Result<()> {
 
     Ok(())
 }
+
+/// Variant functions travel by name with the default codec: a decoding
+/// session that registers them needs no Variant codec.
+#[tokio::test]
+async fn roundtrip_variant_functions_by_name() -> Result<()> {
+    let ctx = SessionContext::new();
+    let sql = "SELECT to_json(v -> 'a'), v ->> 'n', try_parse_json(j) \
+               FROM (SELECT parse_json(j) AS v, j FROM (VALUES ('{\"a\":[1],\"n\":2}')) AS t(j))";
+    super::roundtrip_test_sql_with_context(sql, &ctx).await
+}

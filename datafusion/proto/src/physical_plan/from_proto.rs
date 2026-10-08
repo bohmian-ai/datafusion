@@ -316,6 +316,7 @@ pub fn parse_physical_expr_with_converter(
                         convert_required!(e.return_type)?,
                         true,
                     )
+                    .with_metadata(e.return_field_metadata.clone())
                     .into(),
                     config_options,
                 )

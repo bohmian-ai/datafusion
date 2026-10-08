@@ -175,13 +175,13 @@ struct SessionStateInner {
     /// Table Functions
     table_functions: HashMap<String, Arc<TableFunction>>,
     /// Scalar functions that are registered with the context
-    scalar_functions: HashMap<String, Arc<ScalarUDF>>,
+    scalar_functions: Arc<HashMap<String, Arc<ScalarUDF>>>,
     /// Higher order functions that are registered with the context
-    higher_order_functions: HashMap<String, Arc<HigherOrderUDF>>,
+    higher_order_functions: Arc<HashMap<String, Arc<HigherOrderUDF>>>,
     /// Aggregate functions registered in the context
-    aggregate_functions: HashMap<String, Arc<AggregateUDF>>,
+    aggregate_functions: Arc<HashMap<String, Arc<AggregateUDF>>>,
     /// Window functions registered in the context
-    window_functions: HashMap<String, Arc<WindowUDF>>,
+    window_functions: Arc<HashMap<String, Arc<WindowUDF>>>,
     /// Extension types registry for extensions.
     extension_types: ExtensionTypeRegistryRef,
     /// Deserializer registry for extensions.
@@ -1227,14 +1227,22 @@ impl SessionStateBuilder {
             query_planner: Some(existing.query_planner),
             catalog_list: Some(existing.catalog_list),
             table_functions: Some(existing.table_functions),
-            scalar_functions: Some(existing.scalar_functions.into_values().collect_vec()),
+            scalar_functions: Some(
+                existing.scalar_functions.values().cloned().collect_vec(),
+            ),
             higher_order_functions: Some(
-                existing.higher_order_functions.into_values().collect_vec(),
+                existing
+                    .higher_order_functions
+                    .values()
+                    .cloned()
+                    .collect_vec(),
             ),
             aggregate_functions: Some(
-                existing.aggregate_functions.into_values().collect_vec(),
+                existing.aggregate_functions.values().cloned().collect_vec(),
             ),
-            window_functions: Some(existing.window_functions.into_values().collect_vec()),
+            window_functions: Some(
+                existing.window_functions.values().cloned().collect_vec(),
+            ),
             extension_types: Some(existing.extension_types),
             serializer_registry: Some(existing.serializer_registry),
             file_formats: Some(existing.file_formats.into_values().collect_vec()),
@@ -1683,10 +1691,10 @@ impl SessionStateBuilder {
                 Arc::new(MemoryCatalogProviderList::new()) as Arc<dyn CatalogProviderList>
             }),
             table_functions: table_functions.unwrap_or_default(),
-            scalar_functions: HashMap::new(),
-            higher_order_functions: HashMap::new(),
-            aggregate_functions: HashMap::new(),
-            window_functions: HashMap::new(),
+            scalar_functions: Arc::default(),
+            higher_order_functions: Arc::default(),
+            aggregate_functions: Arc::default(),
+            window_functions: Arc::default(),
             extension_types: Arc::new(MemoryExtensionTypeRegistry::default()),
             serializer_registry: serializer_registry
                 .unwrap_or_else(|| Arc::new(EmptySerializerRegistry)),
@@ -2234,7 +2242,8 @@ impl FunctionRegistry for SessionState {
         &mut self,
         udf: Arc<ScalarUDF>,
     ) -> datafusion_common::Result<Option<Arc<ScalarUDF>>> {
-        let scalar_functions = &mut Arc::make_mut(&mut self.inner).scalar_functions;
+        let scalar_functions =
+            Arc::make_mut(&mut Arc::make_mut(&mut self.inner).scalar_functions);
         udf.aliases().iter().for_each(|alias| {
             scalar_functions.insert(alias.clone(), Arc::clone(&udf));
         });
@@ -2246,7 +2255,7 @@ impl FunctionRegistry for SessionState {
         function: Arc<HigherOrderUDF>,
     ) -> datafusion_common::Result<Option<Arc<HigherOrderUDF>>> {
         let higher_order_functions =
-            &mut Arc::make_mut(&mut self.inner).higher_order_functions;
+            Arc::make_mut(&mut Arc::make_mut(&mut self.inner).higher_order_functions);
         function.aliases().iter().for_each(|alias| {
             higher_order_functions.insert(alias.clone(), Arc::clone(&function));
         });
@@ -2257,7 +2266,8 @@ impl FunctionRegistry for SessionState {
         &mut self,
         udaf: Arc<AggregateUDF>,
     ) -> datafusion_common::Result<Option<Arc<AggregateUDF>>> {
-        let aggregate_functions = &mut Arc::make_mut(&mut self.inner).aggregate_functions;
+        let aggregate_functions =
+            Arc::make_mut(&mut Arc::make_mut(&mut self.inner).aggregate_functions);
         udaf.aliases().iter().for_each(|alias| {
             aggregate_functions.insert(alias.clone(), Arc::clone(&udaf));
         });
@@ -2268,7 +2278,8 @@ impl FunctionRegistry for SessionState {
         &mut self,
         udwf: Arc<WindowUDF>,
     ) -> datafusion_common::Result<Option<Arc<WindowUDF>>> {
-        let window_functions = &mut Arc::make_mut(&mut self.inner).window_functions;
+        let window_functions =
+            Arc::make_mut(&mut Arc::make_mut(&mut self.inner).window_functions);
         udwf.aliases().iter().for_each(|alias| {
             window_functions.insert(alias.clone(), Arc::clone(&udwf));
         });
@@ -2279,7 +2290,8 @@ impl FunctionRegistry for SessionState {
         &mut self,
         name: &str,
     ) -> datafusion_common::Result<Option<Arc<ScalarUDF>>> {
-        let scalar_functions = &mut Arc::make_mut(&mut self.inner).scalar_functions;
+        let scalar_functions =
+            Arc::make_mut(&mut Arc::make_mut(&mut self.inner).scalar_functions);
         let udf = scalar_functions.remove(name);
         if let Some(udf) = &udf {
             for alias in udf.aliases() {
@@ -2294,7 +2306,7 @@ impl FunctionRegistry for SessionState {
         name: &str,
     ) -> datafusion_common::Result<Option<Arc<HigherOrderUDF>>> {
         let higher_order_functions =
-            &mut Arc::make_mut(&mut self.inner).higher_order_functions;
+            Arc::make_mut(&mut Arc::make_mut(&mut self.inner).higher_order_functions);
         let function = higher_order_functions.remove(name);
         if let Some(function) = &function {
             for alias in function.aliases() {
@@ -2308,7 +2320,8 @@ impl FunctionRegistry for SessionState {
         &mut self,
         name: &str,
     ) -> datafusion_common::Result<Option<Arc<AggregateUDF>>> {
-        let aggregate_functions = &mut Arc::make_mut(&mut self.inner).aggregate_functions;
+        let aggregate_functions =
+            Arc::make_mut(&mut Arc::make_mut(&mut self.inner).aggregate_functions);
         let udaf = aggregate_functions.remove(name);
         if let Some(udaf) = &udaf {
             for alias in udaf.aliases() {
@@ -2322,7 +2335,8 @@ impl FunctionRegistry for SessionState {
         &mut self,
         name: &str,
     ) -> datafusion_common::Result<Option<Arc<WindowUDF>>> {
-        let window_functions = &mut Arc::make_mut(&mut self.inner).window_functions;
+        let window_functions =
+            Arc::make_mut(&mut Arc::make_mut(&mut self.inner).window_functions);
         let udwf = window_functions.remove(name);
         if let Some(udwf) = &udwf {
             for alias in udwf.aliases() {
@@ -2401,11 +2415,17 @@ impl From<&SessionState> for TaskContext {
             task_id,
             state.inner.session_id.clone(),
             state.inner.config.clone(),
-            state.inner.scalar_functions.clone(),
-            state.inner.higher_order_functions.clone(),
-            state.inner.aggregate_functions.clone(),
-            state.inner.window_functions.clone(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
             Arc::clone(&state.inner.runtime_env),
+        )
+        .with_shared_functions(
+            Arc::clone(&state.inner.scalar_functions),
+            Arc::clone(&state.inner.higher_order_functions),
+            Arc::clone(&state.inner.aggregate_functions),
+            Arc::clone(&state.inner.window_functions),
         )
     }
 }
@@ -2515,6 +2535,34 @@ mod tests {
                 info.canonical_name
             );
         }
+    }
+
+    #[test]
+    fn task_context_shares_the_session_function_registries() -> Result<()> {
+        use datafusion_execution::TaskContext;
+        use datafusion_execution::registry::FunctionRegistry;
+
+        let state = SessionStateBuilder::new().with_default_features().build();
+        let mut task = TaskContext::from(&state);
+        assert!(std::ptr::eq(
+            state.scalar_functions(),
+            task.scalar_functions()
+        ));
+        assert!(std::ptr::eq(
+            state.aggregate_functions(),
+            task.aggregate_functions()
+        ));
+        assert!(std::ptr::eq(
+            state.window_functions(),
+            task.window_functions()
+        ));
+
+        let upper = Arc::clone(&state.scalar_functions()["upper"]);
+        let renamed = Arc::new(upper.as_ref().clone().with_aliases(["upper_alias"]));
+        task.register_udf(renamed)?;
+        assert!(task.scalar_functions().contains_key("upper_alias"));
+        assert!(!state.scalar_functions().contains_key("upper_alias"));
+        Ok(())
     }
 
     #[test]

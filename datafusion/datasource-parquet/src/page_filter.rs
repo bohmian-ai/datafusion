@@ -198,6 +198,26 @@ impl PagePruningAccessPlanFilter {
         }
     }
 
+    /// Create the page filter for a predicate that is a single conjunct from
+    /// the pruning predicate already built for it (same schema and `IN (...)`
+    /// cap), instead of building that predicate a second time.
+    ///
+    /// `None` means that build found nothing to prune with, which leaves this
+    /// filter empty, exactly as [`Self::new_with_max_in_list_size`] would.
+    pub(crate) fn from_single_conjunct(
+        pruning_predicate: Option<&PruningPredicate>,
+    ) -> Self {
+        let predicates: Vec<_> = pruning_predicate
+            .filter(|pp| pp.required_columns().single_column().is_some())
+            .into_iter()
+            .cloned()
+            .collect();
+        Self {
+            all_predicates_supported: !predicates.is_empty(),
+            predicates,
+        }
+    }
+
     /// Returns an updated [`ParquetAccessPlan`] by applying predicates to the
     /// parquet page index, if any
     pub fn prune_plan_with_page_index(

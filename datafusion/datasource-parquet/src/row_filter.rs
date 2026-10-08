@@ -78,6 +78,7 @@ use parquet::file::metadata::ParquetMetaData;
 use datafusion_common::Result;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::tree_node::TreeNode;
+#[cfg(test)]
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
 
@@ -87,7 +88,7 @@ use super::ParquetFileMetrics;
 use super::supported_predicates::supports_list_predicates;
 use crate::projection_read_plan::{
     ParquetReadPlan, PushdownChecker, PushdownColumns, assemble_read_plan,
-    build_read_plan_with_cast_clipping,
+    build_read_plan_with_cast_clipping, rebase_onto_read,
 };
 
 /// A "compiled" predicate passed to `ParquetRecordBatchStream` to perform
@@ -505,9 +506,10 @@ pub(crate) fn prebuild_row_filter_candidates(
     let prebuilt: Vec<PrebuiltRowFilterCandidate> = candidates
         .into_iter()
         .map(|candidate| {
-            let physical_expr = reassign_expr_columns(
+            let physical_expr = rebase_onto_read(
                 Arc::clone(&candidate.expr),
                 &candidate.read_plan.projected_schema,
+                file_schema,
             )?;
             Ok(PrebuiltRowFilterCandidate {
                 physical_expr,

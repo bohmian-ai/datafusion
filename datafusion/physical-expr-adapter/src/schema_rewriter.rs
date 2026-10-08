@@ -29,7 +29,7 @@ use arrow::datatypes::{DataType, FieldRef, Fields, SchemaRef};
 use datafusion_common::{
     DataFusionError, Result, ScalarValue, exec_err,
     metadata::FieldMetadata,
-    nested_struct::{requires_nested_struct_cast, validate_data_type_compatibility},
+    nested_struct::{requires_nested_struct_cast, validate_field_cast_compatibility},
     tree_node::{Transformed, TransformedResult, TreeNode},
 };
 #[cfg(test)]
@@ -398,6 +398,10 @@ impl DefaultPhysicalExprAdapterRewriter {
             return Ok(Transformed::yes(transformed));
         }
 
+        if let Some(transformed) = self.try_drop_layout_cast(&expr)? {
+            return Ok(Transformed::yes(transformed));
+        }
+
         if let Some(column) = expr.downcast_ref::<Column>() {
             let transformed = self.rewrite_column(Arc::clone(&expr), column)?;
             self.record_generated_struct_cast(&transformed.data);
@@ -600,6 +604,74 @@ impl DefaultPhysicalExprAdapterRewriter {
         ))))
     }
 
+    /// Pass a file's field straight to a function argument declared with
+    /// [`InputFieldRequirement::accepts_any_layout`].
+    ///
+    /// Only Struct casts this adapter generated, whose source and target carry
+    /// the same extension type (for example a shredded and an unshredded
+    /// Variant), are dropped. The function is rebuilt over the file's fields
+    /// and the rewrite is kept only when the function accepts them, declares
+    /// every dropped argument as any-layout, and keeps its logical return
+    /// field. Readers can then decode only the leaves the function declares.
+    ///
+    /// [`InputFieldRequirement::accepts_any_layout`]: datafusion_expr::InputFieldRequirement::accepts_any_layout
+    fn try_drop_layout_cast(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+    ) -> Result<Option<Arc<dyn PhysicalExpr>>> {
+        let Some(function) = expr.downcast_ref::<ScalarFunctionExpr>() else {
+            return Ok(None);
+        };
+        let mut args = function.args().to_vec();
+        let mut dropped = Vec::new();
+        for (index, arg) in function.args().iter().enumerate() {
+            let Some(cast) = arg.downcast_ref::<CastExpr>() else {
+                continue;
+            };
+            if !self
+                .generated_struct_casts
+                .contains_key(&Arc::as_ptr(arg).cast::<()>())
+            {
+                continue;
+            }
+            let source = cast.expr().return_field(&self.physical_file_schema)?;
+            let extension = source.extension_type_name();
+            if extension.is_none()
+                || extension != cast.target_field().extension_type_name()
+            {
+                continue;
+            }
+            args[index] = Arc::clone(cast.expr());
+            dropped.push(index);
+        }
+        if dropped.is_empty() {
+            return Ok(None);
+        }
+        let Ok(rebuilt) = ScalarFunctionExpr::try_new(
+            Arc::new(function.fun().clone()),
+            args,
+            &self.physical_file_schema,
+            Arc::new(function.config_options().clone()),
+        ) else {
+            return Ok(None);
+        };
+        let requirements = rebuilt
+            .required_input_fields(&self.physical_file_schema)
+            .unwrap_or_default();
+        let declared = dropped.iter().all(|index| {
+            requirements.iter().any(|requirement| {
+                requirement.arg_index == *index && requirement.accepts_any_layout
+            })
+        });
+        if !declared
+            || rebuilt.return_field(&self.physical_file_schema)?
+                != expr.return_field(&self.logical_file_schema)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(rebuilt)))
+    }
+
     /// Replace a field access with null when its path exists in the logical
     /// schema but is missing from the physical struct.
     fn try_rewrite_struct_field_access(
@@ -716,11 +788,7 @@ impl DefaultPhysicalExprAdapterRewriter {
         // TODO: add optimization to move the cast from the column to literal expressions in the case of `col = 123`
         // since that's much cheaper to evaluate.
         // See https://github.com/apache/datafusion/issues/15780#issuecomment-2824716928
-        validate_data_type_compatibility(
-            resolved_column.name(),
-            physical_field.data_type(),
-            logical_field.data_type(),
-        )
+        validate_field_cast_compatibility(physical_field.as_ref(), logical_field)
         .map_err(|e| {
             DataFusionError::Execution(format!(
                 "Cannot cast column '{}' from '{}' (physical data type) to '{}' (logical data type): {e}",

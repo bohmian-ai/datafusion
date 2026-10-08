@@ -28,7 +28,8 @@ use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_K
 use datafusion_common::datatype::DataTypeExt;
 use datafusion_common::format::DEFAULT_FORMAT_OPTIONS;
 use datafusion_common::nested_struct::{
-    requires_nested_struct_cast, validate_data_type_compatibility,
+    cast_column_to_field, is_variant, requires_nested_struct_cast,
+    validate_data_type_compatibility,
 };
 use datafusion_common::{Result, not_impl_err};
 use datafusion_expr_common::columnar_value::ColumnarValue;
@@ -329,22 +330,28 @@ impl PhysicalExpr for CastExpr {
 
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
         let value = self.expr.evaluate(batch)?;
-        value
-            .cast_to(self.cast_type(), Some(&self.cast_options))
-            .map_err(|error| {
-                let source = self
-                    .expr
-                    .return_field(batch.schema().as_ref())
-                    .ok()
-                    .filter(|field| !field.name().is_empty())
-                    .map(|field| format!("field '{}'", field.name()))
-                    .unwrap_or_else(|| format!("expression '{}'", self.expr));
-                error.context(format!(
-                    "Failed to cast {source} from {} to {}",
-                    value.data_type(),
-                    self.cast_type()
-                ))
-            })
+        let cast = match &value {
+            // A Variant target converts by value, not by struct field names.
+            ColumnarValue::Array(array) if is_variant(&self.target_field) => {
+                cast_column_to_field(array, &self.target_field, &self.cast_options)
+                    .map(ColumnarValue::Array)
+            }
+            _ => value.cast_to(self.cast_type(), Some(&self.cast_options)),
+        };
+        cast.map_err(|error| {
+            let source = self
+                .expr
+                .return_field(batch.schema().as_ref())
+                .ok()
+                .filter(|field| !field.name().is_empty())
+                .map(|field| format!("field '{}'", field.name()))
+                .unwrap_or_else(|| format!("expression '{}'", self.expr));
+            error.context(format!(
+                "Failed to cast {source} from {} to {}",
+                value.data_type(),
+                self.cast_type()
+            ))
+        })
     }
 
     fn return_field(&self, input_schema: &Schema) -> Result<FieldRef> {

@@ -450,6 +450,18 @@ fn merge_captures_with_variables(
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
+/// A lambda parameter bound to the elements of a List argument; see
+/// [`HigherOrderUDFImpl::list_element_lambda`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ListElementLambda {
+    /// Index of the List argument.
+    pub list_arg: usize,
+    /// Index of the lambda argument.
+    pub lambda_arg: usize,
+    /// Index of the lambda parameter bound to each element.
+    pub parameter: usize,
+}
+
 /// Information about arguments passed to the function
 ///
 /// This structure contains metadata about how the function was called
@@ -754,6 +766,20 @@ pub trait HigherOrderUDFImpl: Debug + DynEq + DynHash + Send + Sync + Any {
         Ok(None)
     }
 
+    /// Describe a List argument whose elements this function reads only
+    /// through one lambda parameter, if any.
+    ///
+    /// When `Some`, each value of `parameter` of the lambda at `lambda_arg`
+    /// is one element of the List at `list_arg`, unchanged, and the function
+    /// reads those elements nowhere else; it may still read the List's
+    /// offsets and nulls. Readers use this to decode only the element fields
+    /// the lambda body needs, and schema adapters to narrow a List cast to
+    /// the parameter. `array_transform` qualifies; `array_filter` does not,
+    /// since it returns the elements themselves.
+    fn list_element_lambda(&self) -> Option<ListElementLambda> {
+        None
+    }
+
     /// What type will be returned by this function, given the arguments?
     ///
     /// The implementation can assume that some other part of the code has coerced
@@ -1018,6 +1044,11 @@ impl HigherOrderUDF {
         self.inner.coerce_values_for_lambdas(fields)
     }
 
+    /// See [`HigherOrderUDFImpl::list_element_lambda`].
+    pub fn list_element_lambda(&self) -> Option<ListElementLambda> {
+        self.inner.list_element_lambda()
+    }
+
     /// Returns the return field of the function given its arguments.
     ///
     /// See [`HigherOrderUDFImpl::return_field_from_args`] for more details.
@@ -1137,6 +1168,10 @@ impl HigherOrderUDFImpl for AliasedHigherOrderUDFImpl {
         fields: &[ValueOrLambda<DataType, DataType>],
     ) -> Result<Option<Vec<DataType>>> {
         self.inner.coerce_values_for_lambdas(fields)
+    }
+
+    fn list_element_lambda(&self) -> Option<ListElementLambda> {
+        self.inner.list_element_lambda()
     }
 
     fn return_field_from_args(

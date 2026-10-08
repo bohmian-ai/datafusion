@@ -875,6 +875,12 @@ pub mod functions_nested {
     pub use datafusion_functions_nested::*;
 }
 
+/// re-export of [`datafusion_functions_variant`] crate, if "variant" feature is enabled
+#[cfg(feature = "variant")]
+pub mod functions_variant {
+    pub use datafusion_functions_variant::*;
+}
+
 /// re-export of [`datafusion_functions_aggregate`] crate
 pub mod functions_aggregate {
     pub use datafusion_functions_aggregate::*;

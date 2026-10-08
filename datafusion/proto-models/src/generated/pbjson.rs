@@ -7677,6 +7677,9 @@ impl serde::Serialize for FileScanExecConf {
         if self.preserve_order.is_some() {
             len += 1;
         }
+        if self.expr_adapter_factory.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.FileScanExecConf", len)?;
         if !self.file_groups.is_empty() {
             struct_ser.serialize_field("fileGroups", &self.file_groups)?;
@@ -7724,6 +7727,11 @@ impl serde::Serialize for FileScanExecConf {
         if let Some(v) = self.preserve_order.as_ref() {
             struct_ser.serialize_field("preserveOrder", v)?;
         }
+        if let Some(v) = self.expr_adapter_factory.as_ref() {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("exprAdapterFactory", pbjson::private::base64::encode(&v).as_str())?;
+        }
         struct_ser.end()
     }
 }
@@ -7757,6 +7765,8 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
             "fileCompressionType",
             "preserve_order",
             "preserveOrder",
+            "expr_adapter_factory",
+            "exprAdapterFactory",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -7775,6 +7785,7 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
             OutputPartitioning,
             FileCompressionType,
             PreserveOrder,
+            ExprAdapterFactory,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -7810,6 +7821,7 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                             "outputPartitioning" | "output_partitioning" => Ok(GeneratedField::OutputPartitioning),
                             "fileCompressionType" | "file_compression_type" => Ok(GeneratedField::FileCompressionType),
                             "preserveOrder" | "preserve_order" => Ok(GeneratedField::PreserveOrder),
+                            "exprAdapterFactory" | "expr_adapter_factory" => Ok(GeneratedField::ExprAdapterFactory),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -7843,6 +7855,7 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                 let mut output_partitioning__ = None;
                 let mut file_compression_type__ = None;
                 let mut preserve_order__ = None;
+                let mut expr_adapter_factory__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::FileGroups => {
@@ -7934,6 +7947,14 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                             }
                             preserve_order__ = map_.next_value()?;
                         }
+                        GeneratedField::ExprAdapterFactory => {
+                            if expr_adapter_factory__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("exprAdapterFactory"));
+                            }
+                            expr_adapter_factory__ = 
+                                map_.next_value::<::std::option::Option<::pbjson::private::BytesDeserialize<_>>>()?.map(|x| x.0)
+                            ;
+                        }
                     }
                 }
                 Ok(FileScanExecConf {
@@ -7951,6 +7972,7 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                     output_partitioning: output_partitioning__,
                     file_compression_type: file_compression_type__,
                     preserve_order: preserve_order__,
+                    expr_adapter_factory: expr_adapter_factory__,
                 })
             }
         }
@@ -22452,6 +22474,9 @@ impl serde::Serialize for PhysicalScalarUdfNode {
         if !self.return_field_name.is_empty() {
             len += 1;
         }
+        if !self.return_field_metadata.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.PhysicalScalarUdfNode", len)?;
         if !self.name.is_empty() {
             struct_ser.serialize_field("name", &self.name)?;
@@ -22473,6 +22498,9 @@ impl serde::Serialize for PhysicalScalarUdfNode {
         if !self.return_field_name.is_empty() {
             struct_ser.serialize_field("returnFieldName", &self.return_field_name)?;
         }
+        if !self.return_field_metadata.is_empty() {
+            struct_ser.serialize_field("returnFieldMetadata", &self.return_field_metadata)?;
+        }
         struct_ser.end()
     }
 }
@@ -22492,6 +22520,8 @@ impl<'de> serde::Deserialize<'de> for PhysicalScalarUdfNode {
             "nullable",
             "return_field_name",
             "returnFieldName",
+            "return_field_metadata",
+            "returnFieldMetadata",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -22502,6 +22532,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalScalarUdfNode {
             ReturnType,
             Nullable,
             ReturnFieldName,
+            ReturnFieldMetadata,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -22529,6 +22560,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalScalarUdfNode {
                             "returnType" | "return_type" => Ok(GeneratedField::ReturnType),
                             "nullable" => Ok(GeneratedField::Nullable),
                             "returnFieldName" | "return_field_name" => Ok(GeneratedField::ReturnFieldName),
+                            "returnFieldMetadata" | "return_field_metadata" => Ok(GeneratedField::ReturnFieldMetadata),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -22554,6 +22586,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalScalarUdfNode {
                 let mut return_type__ = None;
                 let mut nullable__ = None;
                 let mut return_field_name__ = None;
+                let mut return_field_metadata__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Name => {
@@ -22594,6 +22627,14 @@ impl<'de> serde::Deserialize<'de> for PhysicalScalarUdfNode {
                             }
                             return_field_name__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::ReturnFieldMetadata => {
+                            if return_field_metadata__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("returnFieldMetadata"));
+                            }
+                            return_field_metadata__ = Some(
+                                map_.next_value::<std::collections::HashMap<_, _>>()?
+                            );
+                        }
                     }
                 }
                 Ok(PhysicalScalarUdfNode {
@@ -22603,6 +22644,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalScalarUdfNode {
                     return_type: return_type__,
                     nullable: nullable__.unwrap_or_default(),
                     return_field_name: return_field_name__.unwrap_or_default(),
+                    return_field_metadata: return_field_metadata__.unwrap_or_default(),
                 })
             }
         }

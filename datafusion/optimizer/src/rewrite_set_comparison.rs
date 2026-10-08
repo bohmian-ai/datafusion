@@ -21,7 +21,7 @@
 
 use crate::utils::merge_into_schema;
 use crate::{OptimizerConfig, OptimizerRule};
-use datafusion_common::tree_node::{Transformed, TreeNode};
+use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{Column, DFSchema, ExprSchema, Result, ScalarValue, plan_err};
 use datafusion_expr::expr::{self, Exists, SetComparison, SetQuantifier};
 use datafusion_expr::logical_plan::Subquery;
@@ -45,6 +45,21 @@ impl RewriteSetComparison {
     }
 
     fn rewrite_plan(&self, plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+        // Merging the input schemas below allocates; most nodes hold no set
+        // comparison, so check for one first.
+        let mut has_set_comparison = false;
+        plan.apply_expressions(|expr| {
+            has_set_comparison =
+                expr.exists(|e| Ok(matches!(e, Expr::SetComparison(_))))?;
+            Ok(if has_set_comparison {
+                TreeNodeRecursion::Stop
+            } else {
+                TreeNodeRecursion::Continue
+            })
+        })?;
+        if !has_set_comparison {
+            return Ok(Transformed::no(plan));
+        }
         let mut schema = merge_schema(&plan.inputs());
         if let Some(merge_schema) = merge_into_schema(&plan)? {
             schema = merge_schema;
