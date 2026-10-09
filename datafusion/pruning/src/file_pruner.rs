@@ -51,9 +51,10 @@ pub struct FilePruner {
     /// predicates built later for the same file so the first build can be
     /// reused for them (see [`Self::reusable_pruning_predicate`]).
     max_in_list_size: usize,
-    /// The result of the last pruning predicate build, kept so the scan can
-    /// reuse it instead of building the same predicate again per file.
-    built: Option<Option<Arc<PruningPredicate>>>,
+    /// The result of the last pruning predicate build (valid once
+    /// `checked_once` is set), kept so the scan can reuse it instead of
+    /// building the same predicate again per file.
+    built: Option<Arc<PruningPredicate>>,
 }
 
 impl FilePruner {
@@ -144,10 +145,11 @@ impl FilePruner {
         predicate: &Arc<dyn PhysicalExpr>,
         schema: &SchemaRef,
     ) -> Option<Option<Arc<PruningPredicate>>> {
-        let reusable = !self.is_watching()
+        let reusable = self.checked_once
+            && !self.is_watching()
             && Arc::ptr_eq(&self.predicate, predicate)
             && (Arc::ptr_eq(&self.file_schema, schema) || self.file_schema == *schema);
-        reusable.then(|| self.built.clone()).flatten()
+        reusable.then(|| self.built.clone())
     }
 
     /// Returns `true` if this pruner watches a dynamic filter that can still
@@ -183,7 +185,7 @@ impl FilePruner {
             .with_error_counter(&self.predicate_creation_errors)
             .with_max_in_list_size(self.max_in_list_size)
             .build(Arc::clone(&self.predicate));
-        self.built = Some(pruning_predicate.clone());
+        self.built.clone_from(&pruning_predicate);
         let Some(pruning_predicate) = pruning_predicate else {
             return Ok(false);
         };

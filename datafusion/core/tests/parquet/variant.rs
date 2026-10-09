@@ -161,7 +161,7 @@ async fn shredded_variant_reads_as_canonical_at_every_depth() -> Result<()> {
 
     let s = column(&ctx, "SELECT s FROM t").await?;
     let s_v = Arc::clone(s.as_struct().column(0));
-    assert_eq!(s.is_null(1), true);
+    assert!(s.is_null(1));
     assert_eq!(json(&s_v)[0].as_deref(), Some("10"));
     assert_eq!(json(&s_v)[2].as_deref(), Some(r#"{"k":1}"#));
 
@@ -708,6 +708,114 @@ async fn typed_key_comparisons_prune_row_groups() -> Result<()> {
         expected.sort();
         assert_eq!(values, expected, "{sql}");
         assert_eq!(row_groups_pruned(&plan), pruned, "{sql}");
+    }
+    Ok(())
+}
+
+/// Metadata and value bytes of three invalid Variants: malformed metadata, a
+/// value whose one list element is truncated, and a value nested 20,000
+/// lists deep, far past arrow-rs's nesting limit.
+fn invalid_variants() -> [(&'static str, Vec<u8>, Vec<u8>); 3] {
+    let metadata = vec![0x01, 0x00, 0x00];
+    let mut deep = vec![0x00];
+    for _ in 0..20_000 {
+        let mut list = vec![0x0F, 1];
+        list.extend_from_slice(&0u32.to_le_bytes());
+        list.extend_from_slice(&(deep.len() as u32).to_le_bytes());
+        list.append(&mut deep);
+        deep = list;
+    }
+    [
+        ("malformed metadata", vec![0x01, 0x05, 0x00], vec![0x00]),
+        (
+            "malformed value",
+            metadata.clone(),
+            vec![0x0F, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0x0C],
+        ),
+        ("too deep", metadata, deep),
+    ]
+}
+
+/// A file whose one row holds `metadata` and `value` as Variant `v`, stored
+/// canonically or shredded as `Int64` with the row in its `value`, and
+/// registered as `t` with a canonical Variant column.
+async fn invalid_variant_table(
+    metadata: &[u8],
+    value: &[u8],
+    shredded: bool,
+) -> SessionContext {
+    use arrow::array::{BinaryArray, Int64Array};
+
+    let mut fields = vec![
+        Field::new("metadata", DataType::Binary, false),
+        Field::new("value", DataType::Binary, shredded),
+    ];
+    let mut columns: Vec<ArrayRef> = vec![
+        Arc::new(BinaryArray::from(vec![metadata])),
+        Arc::new(BinaryArray::from(vec![value])),
+    ];
+    if shredded {
+        fields.push(Field::new("typed_value", DataType::Int64, true));
+        columns.push(Arc::new(Int64Array::from(vec![None])));
+    }
+    let v: ArrayRef = Arc::new(StructArray::new(Fields::from(fields), columns, None));
+    let batch = RecordBatch::try_from_iter([("v", v)]).unwrap();
+    table(
+        &batch,
+        None,
+        Arc::new(Schema::new(vec![variant_field("v")])),
+    )
+    .await
+}
+
+/// Asserts `result` is an error that arrow-rs or DataFusion raised, not a
+/// panic caught from a task.
+fn assert_decode_error<T>(result: Result<T>, context: &str) {
+    use datafusion::error::DataFusionError;
+
+    let Err(error) = result else {
+        panic!("{context}: expected an error");
+    };
+    assert!(
+        matches!(
+            error.find_root(),
+            DataFusionError::ArrowError(..) | DataFusionError::Execution(..)
+        ),
+        "{context}: {error:?}"
+    );
+}
+
+/// An invalid stored Variant is an error, never a panic or a stack
+/// overflow, whether the file stores it canonically or shredded. Reading a
+/// shredded column converts it to the canonical layout, which decodes it; a
+/// canonical column is returned as stored, and decoding the result fails.
+#[tokio::test]
+async fn invalid_stored_variants_are_errors() -> Result<()> {
+    for (case, metadata, value) in invalid_variants() {
+        for shredded in [false, true] {
+            let ctx = invalid_variant_table(&metadata, &value, shredded).await;
+            let context = format!("{case}, shredded = {shredded}");
+
+            let v = column(&ctx, "SELECT v FROM t").await;
+            if shredded {
+                assert_decode_error(v, &format!("SELECT v: {context}"));
+            } else {
+                let v = v?;
+                assert_decode_error(
+                    variant_to_json(&v).map_err(Into::into),
+                    &format!("variant_to_json(SELECT v): {context}"),
+                );
+            }
+            for sql in [
+                "SELECT variant_get(v, 'k') FROM t",
+                "SELECT to_json(v) FROM t",
+            ] {
+                assert_decode_error(
+                    column(&ctx, sql).await,
+                    &format!("{sql}: {context}"),
+                );
+            }
+        }
     }
     Ok(())
 }
