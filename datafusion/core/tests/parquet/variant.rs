@@ -258,6 +258,27 @@ async fn parse_json_refuses_invalid_json_and_try_parse_json_nulls_it() -> Result
 }
 
 #[tokio::test]
+async fn parse_json_keeps_unsigned_64_bit_integers_exact() -> Result<()> {
+    let ctx = SessionContext::new();
+    let batches = ctx
+        .sql(r#"SELECT parse_json('{"u": 18446744073709551615}') ->> 'u' AS u"#)
+        .await?
+        .collect()
+        .await?;
+    datafusion::assert_batches_eq!(
+        [
+            "+----------------------+",
+            "| u                    |",
+            "+----------------------+",
+            "| 18446744073709551615 |",
+            "+----------------------+",
+        ],
+        &batches
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn functions_read_shredded_files() -> Result<()> {
     let ctx = shredded_table().await;
     let batches = ctx
