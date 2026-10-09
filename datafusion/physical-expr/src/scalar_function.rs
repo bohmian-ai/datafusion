@@ -204,6 +204,31 @@ impl ScalarFunctionExpr {
         .then_some(source)
     }
 
+    /// Ask the UDF where its value is stored in one argument against this
+    /// schema. The argument index is validated and both paths are non-empty;
+    /// callers resolve the paths against the argument's field. See
+    /// [`datafusion_expr::ScalarUDFImpl::stored_value`].
+    pub fn stored_value(&self, schema: &Schema) -> Option<datafusion_expr::StoredValue> {
+        let fields = self
+            .args
+            .iter()
+            .map(|arg| arg.return_field(schema).ok())
+            .collect::<Option<Vec<_>>>()?;
+        let literals = self
+            .args
+            .iter()
+            .map(|arg| arg.downcast_ref::<Literal>().map(Literal::value))
+            .collect::<Vec<_>>();
+        let stored = self.fun.stored_value(ReturnFieldArgs {
+            arg_fields: &fields,
+            scalar_arguments: &literals,
+        })?;
+        (stored.arg_index < self.args.len()
+            && !stored.typed_path.is_empty()
+            && !stored.residual_path.is_empty())
+        .then_some(stored)
+    }
+
     /// Ask the UDF for input requirements against this schema, validating every
     /// argument index and struct path. Invalid declarations retain full inputs.
     /// Column names are resolved again because projection analysis can receive

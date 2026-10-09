@@ -24,7 +24,7 @@ use arrow::array::{
     Array, ArrayRef, AsArray, ListArray, RecordBatch, StringArray, StructArray,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer};
-use arrow_schema::{DataType, Field, Fields, Schema};
+use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use bytes::{BufMut, BytesMut};
 use datafusion::common::Result;
 use datafusion::datasource::listing::{
@@ -39,6 +39,7 @@ use datafusion_datasource::ListingTableUrl;
 use datafusion_execution::object_store::ObjectStoreUrl;
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
 use parquet::arrow::ArrowWriter;
+use parquet::file::properties::WriterProperties;
 use parquet_variant_compute::{json_to_variant, shred_variant, variant_to_json};
 
 /// The canonical (unshredded) Variant field a table declares.
@@ -95,20 +96,6 @@ async fn shredded_table() -> SessionContext {
         None,
     ));
     let batch = RecordBatch::try_from_iter([("v", v), ("s", s), ("l", l)]).unwrap();
-
-    let mut out = BytesMut::new().writer();
-    let mut writer = ArrowWriter::try_new(&mut out, batch.schema(), None).unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
-    let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
-    store
-        .put(
-            &Path::from("variant.parquet"),
-            out.into_inner().freeze().into(),
-        )
-        .await
-        .unwrap();
-
     let table_schema = Arc::new(Schema::new(vec![
         variant_field("v"),
         Field::new(
@@ -122,9 +109,29 @@ async fn shredded_table() -> SessionContext {
             true,
         ),
     ]));
+    table(&batch, None, table_schema).await
+}
+
+/// `batch` written as one Parquet file with `properties`, registered as
+/// table `t` whose schema is `table_schema`.
+async fn table(
+    batch: &RecordBatch,
+    properties: Option<WriterProperties>,
+    table_schema: SchemaRef,
+) -> SessionContext {
+    let mut out = BytesMut::new().writer();
+    let mut writer = ArrowWriter::try_new(&mut out, batch.schema(), properties).unwrap();
+    writer.write(batch).unwrap();
+    writer.close().unwrap();
+    let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+    store
+        .put(&Path::from("t.parquet"), out.into_inner().freeze().into())
+        .await
+        .unwrap();
+
     let ctx = SessionContext::new();
     let url = ObjectStoreUrl::parse("memory://").unwrap();
-    ctx.register_object_store(url.as_ref(), Arc::clone(&store));
+    ctx.register_object_store(url.as_ref(), store);
     let config = ListingTableConfig::new(ListingTableUrl::parse("memory:///").unwrap())
         .infer_options(&ctx.state())
         .await
@@ -439,20 +446,7 @@ async fn object_shredded_table() -> SessionContext {
     ));
     let l_field = Field::new("l", DataType::List(l_element), true);
     let schema = Arc::new(Schema::new(vec![v_field, s_field, l_field]));
-    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![v, s, l]).unwrap();
-
-    let mut out = BytesMut::new().writer();
-    let mut writer = ArrowWriter::try_new(&mut out, schema, None).unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
-    let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
-    store
-        .put(
-            &Path::from("object.parquet"),
-            out.into_inner().freeze().into(),
-        )
-        .await
-        .unwrap();
+    let batch = RecordBatch::try_new(schema, vec![v, s, l]).unwrap();
 
     let s_type = DataType::Struct(Fields::from(vec![variant_field("v")]));
     let table_schema = Arc::new(Schema::new(vec![
@@ -460,17 +454,7 @@ async fn object_shredded_table() -> SessionContext {
         Field::new("s", s_type.clone(), true),
         Field::new("l", DataType::new_list(s_type, true), true),
     ]));
-    let ctx = SessionContext::new();
-    let url = ObjectStoreUrl::parse("memory://").unwrap();
-    ctx.register_object_store(url.as_ref(), Arc::clone(&store));
-    let config = ListingTableConfig::new(ListingTableUrl::parse("memory:///").unwrap())
-        .infer_options(&ctx.state())
-        .await
-        .unwrap()
-        .with_schema(table_schema);
-    ctx.register_table("t", Arc::new(ListingTable::try_new(config).unwrap()))
-        .unwrap();
-    ctx
+    table(&batch, None, table_schema).await
 }
 
 #[tokio::test]
@@ -540,6 +524,127 @@ async fn shredded_paths_read_only_their_leaves() -> Result<()> {
             filtered * 10 < whole,
             "{sql}: read {filtered} bytes, whole read {whole}"
         );
+    }
+    Ok(())
+}
+
+/// Row groups the Parquet scans under `plan` skipped by statistics.
+fn row_groups_pruned(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> usize {
+    use datafusion::physical_plan::metrics::MetricValue;
+
+    plan.metrics().map_or(0, |metrics| {
+        metrics
+            .iter()
+            .filter_map(|metric| match metric.value() {
+                MetricValue::PruningMetrics {
+                    name,
+                    pruning_metrics,
+                } if name == "row_groups_pruned_statistics" => {
+                    Some(pruning_metrics.pruned())
+                }
+                _ => None,
+            })
+            .sum()
+    }) + plan
+        .children()
+        .into_iter()
+        .map(row_groups_pruned)
+        .sum::<usize>()
+}
+
+/// A comparison with a shredded key skips row groups whose typed values
+/// cannot match, unless the key's residual holds values in that row group.
+#[tokio::test]
+async fn typed_key_comparisons_prune_row_groups() -> Result<()> {
+    use parquet_variant_compute::VariantType;
+
+    // Row groups of four: `b` is a string everywhere except one number in
+    // the second, stored in its residual; the third lacks `a` in one row.
+    let text: ArrayRef = Arc::new(StringArray::from(vec![
+        r#"{"a":1,"b":"p"}"#,
+        r#"{"a":2,"b":"p"}"#,
+        r#"{"a":3,"b":"q"}"#,
+        r#"{"a":4,"b":"q"}"#,
+        r#"{"a":10,"b":"p"}"#,
+        r#"{"a":11,"b":5}"#,
+        r#"{"a":12,"b":"q"}"#,
+        r#"{"a":13,"b":"q"}"#,
+        r#"{"a":100,"b":"z"}"#,
+        r#"{"b":"z"}"#,
+        r#"{"a":102,"b":"z"}"#,
+        r#"{"a":103,"b":"z"}"#,
+    ]));
+    let object = DataType::Struct(Fields::from(vec![
+        Field::new("a", DataType::Int64, true),
+        Field::new("b", DataType::Utf8, true),
+    ]));
+    let v =
+        ArrayRef::from(shred_variant(&json_to_variant(&text).unwrap(), &object).unwrap());
+    let v_field =
+        Field::new("v", v.data_type().clone(), true).with_extension_type(VariantType);
+    let batch =
+        RecordBatch::try_new(Arc::new(Schema::new(vec![v_field])), vec![v]).unwrap();
+    let properties = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(4))
+        .build();
+    let ctx = table(
+        &batch,
+        Some(properties),
+        Arc::new(Schema::new(vec![variant_field("v")])),
+    )
+    .await;
+
+    for (sql, expected, pruned) in [
+        // The second row group's residual may hold "z".
+        (
+            "SELECT v ->> 'b' FROM t WHERE v ->> 'b' = 'z'",
+            vec!["z"; 4],
+            1,
+        ),
+        (
+            "SELECT v ->> 'a' FROM t WHERE v ->> 'b' = '5'",
+            vec!["11"],
+            2,
+        ),
+        (
+            "SELECT v ->> 'b' FROM t WHERE 'q' < v ->> 'b'",
+            vec!["z"; 4],
+            1,
+        ),
+        (
+            "SELECT v ->> 'a' FROM t WHERE CAST(v ->> 'a' AS BIGINT) = 2",
+            vec!["2"],
+            2,
+        ),
+        (
+            "SELECT v ->> 'a' FROM t WHERE CAST(v ->> 'a' AS INT) > 50",
+            vec!["100", "102", "103"],
+            2,
+        ),
+        // As text, integers do not follow their order.
+        (
+            "SELECT v ->> 'a' FROM t WHERE v ->> 'a' < '2'",
+            vec!["1", "10", "11", "12", "13", "100", "102", "103"],
+            0,
+        ),
+    ] {
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let batches =
+            datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+        // Row groups are read in parallel.
+        let mut values = batches
+            .iter()
+            .flat_map(|batch| batch.column(0).as_string::<i32>().iter())
+            .map(|value| value.map(str::to_owned))
+            .collect::<Vec<_>>();
+        values.sort();
+        let mut expected = expected
+            .into_iter()
+            .map(|value| Some(value.to_owned()))
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(values, expected, "{sql}");
+        assert_eq!(row_groups_pruned(&plan), pruned, "{sql}");
     }
     Ok(())
 }

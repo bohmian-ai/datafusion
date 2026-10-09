@@ -87,6 +87,19 @@ pub struct InputFieldRequirement {
     pub accepts_any_layout: bool,
 }
 
+/// Fields of one argument that store a scalar function's value.
+/// See [`ScalarUDFImpl::stored_value`] for the contract.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StoredValue {
+    /// Index of the argument holding both fields.
+    pub arg_index: usize,
+    /// Path through struct fields to the field holding the value.
+    pub typed_path: Vec<String>,
+    /// Path through struct fields to the field that is null wherever
+    /// `typed_path` holds the value.
+    pub residual_path: Vec<String>,
+}
+
 /// Logical representation of a Scalar User Defined Function.
 ///
 /// A scalar function produces a single row output for each row of input. This
@@ -372,6 +385,11 @@ impl ScalarUDF {
         args: ReturnFieldArgs,
     ) -> Option<Vec<InputFieldRequirement>> {
         self.inner.required_input_fields(args)
+    }
+
+    /// See [`ScalarUDFImpl::stored_value`].
+    pub fn stored_value(&self, args: ReturnFieldArgs) -> Option<StoredValue> {
+        self.inner.stored_value(args)
     }
 
     /// See [`ScalarUDFImpl::struct_field_mapping`] for more details.
@@ -1150,6 +1168,24 @@ pub trait ScalarUDFImpl: Debug + DynEq + DynHash + Send + Sync + Any {
         None
     }
 
+    /// Describe a field of an argument that stores this call's value.
+    ///
+    /// The supplied argument fields describe the schema at the point of use,
+    /// and `scalar_arguments` exposes known literals. Return a
+    /// [`StoredValue`] when, in every row where the `residual_path` field of
+    /// argument `arg_index` is null, the call returns the `typed_path` field
+    /// cast to the call's return type, or null where that field is null. Both
+    /// paths are non-empty, traverse only Struct fields, and end at non-nested
+    /// fields. Nothing is asserted for rows where the residual field is not
+    /// null.
+    ///
+    /// Statistics pruning uses this to compare the typed field's statistics
+    /// with a literal, keeping every container whose residual field holds a
+    /// value. Return `None` when these guarantees do not hold.
+    fn stored_value(&self, _args: ReturnFieldArgs) -> Option<StoredValue> {
+        None
+    }
+
     /// For struct-producing functions, return how output fields map to input
     /// arguments. This enables the optimizer to propagate orderings through
     /// struct projections.
@@ -1338,6 +1374,10 @@ impl ScalarUDFImpl for AliasedScalarUDFImpl {
         args: ReturnFieldArgs,
     ) -> Option<Vec<InputFieldRequirement>> {
         self.inner.required_input_fields(args)
+    }
+
+    fn stored_value(&self, args: ReturnFieldArgs) -> Option<StoredValue> {
+        self.inner.stored_value(args)
     }
 
     fn output_ordering(&self, inputs: &[ExprProperties]) -> Result<SortProperties> {

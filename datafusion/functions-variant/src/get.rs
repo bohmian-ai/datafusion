@@ -25,7 +25,7 @@ use datafusion_common::nested_struct::is_variant;
 use datafusion_common::{Result, ScalarValue, plan_err};
 use datafusion_expr::{
     ColumnarValue, ExpressionPlacement, InputFieldRequirement, ReturnFieldArgs,
-    ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
+    ScalarFunctionArgs, ScalarUDFImpl, Signature, StoredValue, Volatility,
 };
 use parquet_variant::{Variant, VariantPath, VariantPathElement};
 use parquet_variant_compute::{
@@ -152,6 +152,52 @@ impl ScalarUDFImpl for VariantGet {
             },
             accepts_any_layout: true,
         }])
+    }
+
+    /// `variant_get_text` over a root that shreds every key of a literal key
+    /// path is stored in the last key's `typed_value` wherever its residual
+    /// `value` is null, when that field is a string, integer, or Boolean:
+    /// casting those to text renders them exactly as this function does.
+    fn stored_value(&self, args: ReturnFieldArgs) -> Option<StoredValue> {
+        if !self.text {
+            return None;
+        }
+        let keys = args
+            .scalar_arguments
+            .get(1..)?
+            .iter()
+            .map(|key| key.and_then(|key| key.try_as_str().flatten()))
+            .collect::<Option<Vec<_>>>()?;
+        let (last, parents) = keys.split_last()?;
+        let mut fields = object_fields(args.arg_fields.first()?.data_type())?;
+        let mut path = Vec::new();
+        for key in parents {
+            let child = fields.find(key)?.1;
+            path.extend(["typed_value".to_owned(), (*key).to_owned()]);
+            fields = object_fields(child.data_type())?;
+        }
+        let DataType::Struct(leaf) = fields.find(last)?.1.data_type() else {
+            return None;
+        };
+        leaf.find("value")?;
+        let typed = leaf.find("typed_value")?.1.data_type();
+        if !typed.is_integer()
+            && !matches!(
+                typed,
+                DataType::Boolean
+                    | DataType::Utf8
+                    | DataType::LargeUtf8
+                    | DataType::Utf8View
+            )
+        {
+            return None;
+        }
+        path.extend(["typed_value".to_owned(), (*last).to_owned()]);
+        Some(StoredValue {
+            arg_index: 0,
+            typed_path: [path.as_slice(), &["typed_value".to_owned()]].concat(),
+            residual_path: [path.as_slice(), &["value".to_owned()]].concat(),
+        })
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {

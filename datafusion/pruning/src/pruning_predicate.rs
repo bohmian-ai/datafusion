@@ -548,8 +548,8 @@ impl<'a> PruningPredicateBuilder<'a> {
         // build predicate expression once
         let mut required_columns = RequiredColumns::new();
         let mut properties = PruningExpressionProperties::default();
-        let (prunable_predicate, pruning_schema) =
-            required_columns.rewrite_struct_fields(&predicate, &file_schema)?;
+        let (prunable_predicate, pruning_schema) = required_columns
+            .rewrite_struct_fields(&predicate, &file_schema, &mut properties)?;
         let predicate_expr = build_predicate_expression(
             &prunable_predicate,
             &pruning_schema,
@@ -885,15 +885,26 @@ impl RequiredColumns {
     }
 
     /// Replace exact struct-field access with scalar columns for the existing
-    /// pruning rules. Neither the original expression nor its schema is changed.
+    /// pruning rules, and comparisons of a function's stored value with
+    /// comparisons of the field storing it (see [`Self::stored_value_comparison`]).
+    /// Neither the original expression nor its schema is changed.
     fn rewrite_struct_fields(
         &mut self,
         predicate: &PhysicalExprRef,
         schema: &SchemaRef,
+        properties: &mut PruningExpressionProperties,
     ) -> Result<(PhysicalExprRef, SchemaRef)> {
         let mut fields = None;
         let rewritten = Arc::clone(predicate)
             .transform_down(|expr| {
+                if let Some(comparison) =
+                    self.stored_value_comparison(&expr, schema, &mut fields)
+                {
+                    // Rows where the function returns null are not guarded by
+                    // the null checks that full-match inference adds.
+                    properties.has_filter_semantics_only = true;
+                    return Ok(Transformed::yes(comparison));
+                }
                 if expr.downcast_ref::<ScalarFunctionExpr>().is_none() {
                     return Ok(Transformed::no(expr));
                 }
@@ -903,27 +914,7 @@ impl RequiredColumns {
                 if field.data_type().is_nested() {
                     return Ok(Transformed::no(expr));
                 }
-                let column = if let Some((column, _)) =
-                    self.nested_columns
-                        .iter()
-                        .find(|(_, (column, field_path))| {
-                            *column == root && *field_path == path
-                        }) {
-                    column.clone()
-                } else {
-                    let fields = fields.get_or_insert_with(|| schema.fields().to_vec());
-                    let index = fields.len();
-                    let mut name = format!("__datafusion_struct_field_{index}");
-                    while fields.iter().any(|field| field.name() == &name) {
-                        name.push('_');
-                    }
-                    fields.push(Arc::new(
-                        field.as_ref().clone().with_name(&name).with_nullable(true),
-                    ));
-                    let column = phys_expr::Column::new(&name, index);
-                    self.nested_columns.insert(column.clone(), (root, path));
-                    column
-                };
+                let column = self.nested_column(root, path, &field, schema, &mut fields);
                 Ok(Transformed::yes(Arc::new(column) as _))
             })?
             .data;
@@ -934,6 +925,131 @@ impl RequiredColumns {
             },
         );
         Ok((rewritten, schema))
+    }
+
+    /// The synthetic column standing for the leaf at `path` under `root`,
+    /// added to `fields` (initially `schema`'s fields) on first use.
+    fn nested_column(
+        &mut self,
+        root: Column,
+        path: Vec<String>,
+        field: &Field,
+        schema: &SchemaRef,
+        fields: &mut Option<Vec<FieldRef>>,
+    ) -> phys_expr::Column {
+        if let Some((column, _)) = self
+            .nested_columns
+            .iter()
+            .find(|(_, (column, field_path))| *column == root && *field_path == path)
+        {
+            return column.clone();
+        }
+        let fields = fields.get_or_insert_with(|| schema.fields().to_vec());
+        let index = fields.len();
+        let mut name = format!("__datafusion_struct_field_{index}");
+        while fields.iter().any(|field| field.name() == &name) {
+            name.push('_');
+        }
+        fields.push(Arc::new(field.clone().with_name(&name).with_nullable(true)));
+        let column = phys_expr::Column::new(&name, index);
+        self.nested_columns.insert(column.clone(), (root, path));
+        column
+    }
+
+    /// Rewrite `f(..) op literal` or `CAST(f(..) AS t) op literal`, where `f`
+    /// declares a stored value (see [`ScalarFunctionExpr::stored_value`]), into
+    /// `CAST(typed AS <f's type>) op literal OR residual IS NOT NULL` over the
+    /// declared fields. Where `residual` is null `f` returns its `typed` field
+    /// cast to its return type, so a container that may hold a matching row
+    /// fails the typed comparison's statistics only if `residual` is all null.
+    ///
+    /// When `f` returns a string, an integer (or Boolean) `typed` field
+    /// compared as `t` of the same kind is cast to `t` directly: these values
+    /// survive the round trip through their string form, and comparing them
+    /// as strings would not follow their order.
+    fn stored_value_comparison(
+        &mut self,
+        expr: &PhysicalExprRef,
+        schema: &SchemaRef,
+        fields: &mut Option<Vec<FieldRef>>,
+    ) -> Option<PhysicalExprRef> {
+        let binary = expr.downcast_ref::<phys_expr::BinaryExpr>()?;
+        if !matches!(
+            binary.op(),
+            Operator::Eq
+                | Operator::NotEq
+                | Operator::Lt
+                | Operator::LtEq
+                | Operator::Gt
+                | Operator::GtEq
+        ) {
+            return None;
+        }
+        let (operand, op, literal) = if binary
+            .right()
+            .downcast_ref::<phys_expr::Literal>()
+            .is_some()
+        {
+            (binary.left(), *binary.op(), binary.right())
+        } else if binary.left().downcast_ref::<phys_expr::Literal>().is_some() {
+            (binary.right(), binary.op().swap()?, binary.left())
+        } else {
+            return None;
+        };
+        let (call, target) = match operand.downcast_ref::<phys_expr::CastExpr>() {
+            Some(cast) => (cast.expr(), Some(cast.cast_type())),
+            None => (operand, None),
+        };
+        let function = call.downcast_ref::<ScalarFunctionExpr>()?;
+        let stored = function.stored_value(schema)?;
+        let (root, path, field) =
+            struct_field_column(&function.args()[stored.arg_index], schema)?;
+        let mut leaf = |leaf_path: Vec<String>| {
+            let leaf = leaf_path
+                .iter()
+                .try_fold(Arc::clone(&field), |field, name| child_field(&field, name))?;
+            if leaf.data_type().is_nested() {
+                return None;
+            }
+            let column = self.nested_column(
+                root.clone(),
+                [path.clone(), leaf_path].concat(),
+                &leaf,
+                schema,
+                fields,
+            );
+            Some((Arc::new(column) as PhysicalExprRef, leaf))
+        };
+        let (typed, typed_field) = leaf(stored.typed_path)?;
+        let (residual, _) = leaf(stored.residual_path)?;
+        let cast = |expr: PhysicalExprRef, from: &DataType, to: &DataType| {
+            if from == to {
+                expr
+            } else {
+                Arc::new(phys_expr::CastExpr::new(expr, to.clone(), None)) as _
+            }
+        };
+        let typed_type = typed_field.data_type();
+        let returned = function.return_type();
+        let value = match target {
+            None => cast(typed, typed_type, returned),
+            Some(target)
+                if matches!(
+                    returned,
+                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                ) && ((typed_type.is_integer() && target.is_integer())
+                    || (typed_type == &DataType::Boolean
+                        && target == &DataType::Boolean)) =>
+            {
+                cast(typed, typed_type, target)
+            }
+            Some(target) => cast(cast(typed, typed_type, returned), returned, target),
+        };
+        Some(Arc::new(phys_expr::BinaryExpr::new(
+            Arc::new(phys_expr::BinaryExpr::new(value, op, Arc::clone(literal))),
+            Operator::Or,
+            Arc::new(phys_expr::IsNotNullExpr::new(residual)),
+        )))
     }
 
     /// Returns Some(column) if this is a single column predicate.
@@ -1117,21 +1233,23 @@ fn struct_field_column(
     let (column, mut path, mut field) =
         struct_field_column(&function.args()[access.source_arg], schema)?;
     for name in access.field_path {
-        let DataType::Struct(children) = field.data_type() else {
-            return None;
-        };
-        let mut matches = children.iter().filter(|child| child.name() == &name);
-        let child = Arc::clone(matches.next()?);
-        if matches.next().is_some() {
-            return None;
-        }
-        field = child;
+        field = child_field(&field, &name)?;
         path.push(name);
     }
     if expr.data_type(schema).ok()? != *field.data_type() {
         return None;
     }
     Some((column, path, field))
+}
+
+/// The only child of Struct `field` named `name`.
+fn child_field(field: &FieldRef, name: &str) -> Option<FieldRef> {
+    let DataType::Struct(children) = field.data_type() else {
+        return None;
+    };
+    let mut matches = children.iter().filter(|child| child.name() == name);
+    let child = Arc::clone(matches.next()?);
+    matches.next().is_none().then_some(child)
 }
 
 impl From<Vec<(phys_expr::Column, StatisticsType, Field)>> for RequiredColumns {
@@ -3006,6 +3124,161 @@ mod tests {
                 assert_eq!(actual_path, &path);
             }
         }
+    }
+
+    /// A comparison of a function's stored value prunes by its typed field's
+    /// bounds, but only containers whose residual field is all null.
+    #[test]
+    fn stored_value_comparison_prunes_only_all_null_residuals() {
+        use arrow::array::{Int64Array, StringArray, UInt64Array};
+        use datafusion_expr::{
+            ScalarUDF, ScalarUDFImpl, Signature, StoredValue, Volatility,
+        };
+
+        #[derive(Debug, PartialEq, Eq, Hash)]
+        struct StoredProbe {
+            signature: Signature,
+        }
+        impl ScalarUDFImpl for StoredProbe {
+            fn name(&self) -> &str {
+                "stored_probe"
+            }
+            fn signature(&self) -> &Signature {
+                &self.signature
+            }
+            fn return_type(&self, _: &[DataType]) -> Result<DataType> {
+                Ok(DataType::Utf8)
+            }
+            fn invoke_with_args(
+                &self,
+                _: datafusion_expr::ScalarFunctionArgs,
+            ) -> Result<ColumnarValue> {
+                unreachable!("pruning must evaluate statistics, not the function")
+            }
+            fn stored_value(
+                &self,
+                _: datafusion_expr::ReturnFieldArgs,
+            ) -> Option<StoredValue> {
+                Some(StoredValue {
+                    arg_index: 0,
+                    typed_path: vec!["t".to_owned()],
+                    residual_path: vec!["r".to_owned()],
+                })
+            }
+        }
+
+        /// Bounds of `s.t` and null counts of `s.r` for three containers of
+        /// ten rows: `s.r` holds values only in the second.
+        #[derive(Debug)]
+        struct StoredStats {
+            min: ArrayRef,
+            max: ArrayRef,
+        }
+        impl PruningStatistics for StoredStats {
+            fn min_values(&self, _: &Column) -> Option<ArrayRef> {
+                None
+            }
+            fn max_values(&self, _: &Column) -> Option<ArrayRef> {
+                None
+            }
+            fn min_values_for_path(
+                &self,
+                _: &Column,
+                path: &[String],
+            ) -> Option<ArrayRef> {
+                (path == ["t"]).then(|| Arc::clone(&self.min))
+            }
+            fn max_values_for_path(
+                &self,
+                _: &Column,
+                path: &[String],
+            ) -> Option<ArrayRef> {
+                (path == ["t"]).then(|| Arc::clone(&self.max))
+            }
+            fn null_counts_for_path(
+                &self,
+                _: &Column,
+                path: &[String],
+            ) -> Option<ArrayRef> {
+                (path == ["r"]).then(|| Arc::new(UInt64Array::from(vec![10, 3, 10])) as _)
+            }
+            fn num_containers(&self) -> usize {
+                3
+            }
+            fn null_counts(&self, _: &Column) -> Option<ArrayRef> {
+                None
+            }
+            fn row_counts(&self) -> Option<ArrayRef> {
+                Some(Arc::new(UInt64Array::from(vec![10, 10, 10])))
+            }
+            fn contained(
+                &self,
+                _: &Column,
+                _: &HashSet<ScalarValue>,
+            ) -> Option<BooleanArray> {
+                None
+            }
+        }
+
+        let udf = ScalarUDF::from(StoredProbe {
+            signature: Signature::any(1, Volatility::Immutable),
+        });
+        let schema_with = |typed: DataType| {
+            Arc::new(Schema::new(vec![Field::new(
+                "s",
+                DataType::Struct(
+                    vec![
+                        Field::new("t", typed, true),
+                        Field::new("r", DataType::Binary, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            )]))
+        };
+        let prune = |schema: &SchemaRef, expr: Expr, stats: &StoredStats| {
+            let predicate = PruningPredicateBuilder::new()
+                .with_file_schema(Arc::clone(schema))
+                .try_build(logical2physical(&expr, schema))
+                .unwrap();
+            assert!(!predicate.can_be_inverted_for_full_match());
+            predicate.prune(stats).unwrap()
+        };
+
+        let strings = schema_with(DataType::Utf8View);
+        let stats = StoredStats {
+            min: Arc::new(StringArray::from(vec!["a", "a", "x"])),
+            max: Arc::new(StringArray::from(vec!["c", "c", "z"])),
+        };
+        let call = udf.call(vec![col("s")]);
+        assert_eq!(
+            prune(&strings, call.clone().eq(lit("y")), &stats),
+            [false, true, true]
+        );
+        assert_eq!(
+            prune(&strings, lit("b").gt(call), &stats),
+            [true, true, false]
+        );
+
+        let integers = schema_with(DataType::Int32);
+        let stats = StoredStats {
+            min: Arc::new(Int64Array::from(vec![1, 1, 40])),
+            max: Arc::new(Int64Array::from(vec![9, 9, 60])),
+        };
+        let call = udf.call(vec![col("s")]);
+        assert_eq!(
+            prune(
+                &integers,
+                cast(call.clone(), DataType::Int64).eq(lit(50i64)),
+                &stats
+            ),
+            [false, true, true]
+        );
+        // As text, integers do not follow their order: nothing is pruned.
+        assert_eq!(
+            prune(&integers, call.gt(lit("5")), &stats),
+            [true, true, true]
+        );
     }
 
     /// Row count should only be referenced once in the pruning expression, even if we need the row count

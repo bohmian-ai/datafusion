@@ -151,7 +151,7 @@ pub use udaf::{
 };
 pub use udf::{
     InputFieldRequirement, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
-    StructFieldAccess, StructFieldMapping,
+    StoredValue, StructFieldAccess, StructFieldMapping,
 };
 pub use udwf::{LimitEffect, ReversedUDWF, WindowUDF, WindowUDFImpl};
 pub use window_frame::{WindowFrame, WindowFrameBound, WindowFrameUnits};
