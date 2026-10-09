@@ -178,6 +178,40 @@ explain analyze select events[1] from narrow;
 ----
 Plan with Metrics DataSourceExec: <slt:ignore>metrics=[output_rows=3, <slt:ignore>bytes_scanned=172.0 B<slt:ignore>]
 
+# A field of unnested elements reads only that field: the optimizer maps the
+# List's elements with `array_transform` below the unnest and unnests the
+# result, so the scan reads `x` alone, as `events[2]['x']` does.
+query II
+SELECT id, unnest(events)['x'] FROM narrow ORDER BY id, 2;
+----
+1 10
+2 20
+2 21
+
+query TT
+explain select unnest(events)['x'] from narrow;
+----
+logical_plan
+01)Projection: __datafusion_extracted_1 AS UNNEST(narrow.events)[x]
+02)--Unnest: lists[__datafusion_extracted_1|depth=1] structs[]
+03)----Projection: array_transform(narrow.events, (__datafusion_extracted_1_0) -> get_field(__datafusion_extracted_1_0, Utf8("x"))) AS __datafusion_extracted_1
+04)------TableScan: narrow projection=[events]
+physical_plan
+01)ProjectionExec: expr=[__datafusion_extracted_1@0 as UNNEST(narrow.events)[x]]
+02)--UnnestExec
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_nested_schema_pruning/wide.parquet]]}, projection=[array_transform(events@1, (__datafusion_extracted_1_0) -> get_field(__datafusion_extracted_1_0@1, x)) as __datafusion_extracted_1], file_type=parquet
+
+query TT
+explain analyze select unnest(events)['x'] from narrow;
+----
+Plan with Metrics<slt:ignore>UnnestExec<slt:ignore>projection=[array_transform(events@1, <slt:ignore>bytes_scanned=87.0 B<slt:ignore>
+
+# Reading the unnested elements whole keeps the unnest of `events`.
+query TT
+explain analyze select unnest(events)['x'], unnest(events) from narrow;
+----
+Plan with Metrics<slt:ignore>UnnestExec<slt:ignore>projection=[events@1 as __unnest_placeholder(narrow.events)]<slt:ignore>bytes_scanned=172.0 B<slt:ignore>
+
 # `SELECT *` goes through the same clipped read as an explicit projection.
 query I??
 SELECT * FROM narrow ORDER BY id;

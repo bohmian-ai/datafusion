@@ -519,6 +519,13 @@ async fn shredded_paths_read_only_their_leaves() -> Result<()> {
         "leaf in a lambda over a List read {transformed} bytes, whole read {whole}"
     );
 
+    let (values, unnested) = run(&ctx, "SELECT unnest(l)['v'] ->> 'a' FROM t").await?;
+    assert_eq!(values, expected);
+    assert!(
+        unnested * 10 < whole,
+        "leaf of unnested elements read {unnested} bytes, whole read {whole}"
+    );
+
     ctx.sql("SET datafusion.execution.parquet.pushdown_filters = true")
         .await?
         .collect()

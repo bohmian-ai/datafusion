@@ -781,6 +781,21 @@ pub trait HigherOrderUDFImpl: Debug + DynEq + DynHash + Send + Sync + Any {
         None
     }
 
+    /// Describe how this function maps each element of a List argument
+    /// through one lambda, if it does.
+    ///
+    /// When `Some`, [`Self::list_element_lambda`] holds for the same
+    /// arguments, and the function returns a List with the offsets and
+    /// nulls of the List at `list_arg` whose element `i` is the lambda's
+    /// value for element `i`. Unnesting the result then gives the rows
+    /// unnesting the List and evaluating the lambda body on each element
+    /// gives, so an optimizer may move an expression on unnested elements
+    /// below the unnest as a call of this function. `array_transform`
+    /// qualifies; `array_filter` does not, since it drops elements.
+    fn list_element_map(&self) -> Option<ListElementLambda> {
+        None
+    }
+
     /// What type will be returned by this function, given the arguments?
     ///
     /// The implementation can assume that some other part of the code has coerced
@@ -1050,6 +1065,11 @@ impl HigherOrderUDF {
         self.inner.list_element_lambda()
     }
 
+    /// See [`HigherOrderUDFImpl::list_element_map`].
+    pub fn list_element_map(&self) -> Option<ListElementLambda> {
+        self.inner.list_element_map()
+    }
+
     /// Returns the return field of the function given its arguments.
     ///
     /// See [`HigherOrderUDFImpl::return_field_from_args`] for more details.
@@ -1173,6 +1193,10 @@ impl HigherOrderUDFImpl for AliasedHigherOrderUDFImpl {
 
     fn list_element_lambda(&self) -> Option<ListElementLambda> {
         self.inner.list_element_lambda()
+    }
+
+    fn list_element_map(&self) -> Option<ListElementLambda> {
+        self.inner.list_element_map()
     }
 
     fn return_field_from_args(

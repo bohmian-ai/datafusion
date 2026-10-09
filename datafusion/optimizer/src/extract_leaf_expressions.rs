@@ -25,10 +25,14 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use datafusion_common::alias::AliasGenerator;
-use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion_common::tree_node::{
+    Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
+};
 use datafusion_common::{Column, DFSchema, Result, qualified_name};
+use datafusion_expr::expr::HigherOrderFunction;
 use datafusion_expr::logical_plan::LogicalPlan;
-use datafusion_expr::{Expr, ExpressionPlacement, Projection};
+use datafusion_expr::logical_plan::Unnest;
+use datafusion_expr::{Expr, ExprSchemable, ExpressionPlacement, Projection};
 
 use crate::optimizer::ApplyOrder;
 use crate::push_down_filter::replace_cols_by_name;
@@ -800,8 +804,7 @@ impl OptimizerRule for PushDownLeafProjections {
         if !config.options().optimizer.enable_leaf_expression_pushdown {
             return Ok(Transformed::no(plan));
         }
-        let alias_generator = config.alias_generator();
-        match try_push_input(&plan, alias_generator)? {
+        match try_push_input(&plan, config)? {
             Some(new_plan) => Ok(Transformed::yes(new_plan)),
             None => Ok(Transformed::no(plan)),
         }
@@ -814,12 +817,12 @@ impl OptimizerRule for PushDownLeafProjections {
 /// `None` if there is nothing to push or the projection sits above a barrier.
 fn try_push_input(
     input: &LogicalPlan,
-    alias_generator: &Arc<AliasGenerator>,
+    config: &dyn OptimizerConfig,
 ) -> Result<Option<LogicalPlan>> {
     let LogicalPlan::Projection(proj) = input else {
         return Ok(None);
     };
-    split_and_push_projection(proj, alias_generator)
+    split_and_push_projection(proj, config)
 }
 
 /// If this is a passthrough column.  I.e,
@@ -930,7 +933,7 @@ fn merge_would_duplicate_kept_expr(
 /// ```
 fn split_and_push_projection(
     proj: &Projection,
-    alias_generator: &Arc<AliasGenerator>,
+    config: &dyn OptimizerConfig,
 ) -> Result<Option<LogicalPlan>> {
     // Fast pre-check: skip if there are no pre-existing extracted aliases
     // and no new extractable expressions.
@@ -961,7 +964,7 @@ fn split_and_push_projection(
 
     let mut extractors = vec![LeafExpressionExtractor::new(
         input_schema.as_ref(),
-        alias_generator,
+        config.alias_generator(),
     )];
     let input_column_sets = vec![schema_columns(input_schema.as_ref())];
 
@@ -1063,9 +1066,10 @@ fn split_and_push_projection(
     let pushed = push_extraction_pairs(
         &extraction_pairs,
         columns_needed,
+        &recovery_exprs,
         proj,
         &proj_input,
-        alias_generator,
+        config,
         proj_exprs_captured,
     )?;
 
@@ -1158,12 +1162,15 @@ fn is_pure_extraction_projection(plan: &LogicalPlan) -> bool {
 
 /// Pushes extraction pairs down through the projection's input node,
 /// dispatching to the appropriate handler based on the input node type.
+///
+/// `recovery_exprs` are the expressions evaluated above the pushed pairs.
 fn push_extraction_pairs(
     pairs: &[(Expr, String)],
     columns_needed: &IndexSet<Column>,
+    recovery_exprs: &[Expr],
     proj: &Projection,
     proj_input: &Arc<LogicalPlan>,
-    alias_generator: &Arc<AliasGenerator>,
+    config: &dyn OptimizerConfig,
     proj_exprs_captured: usize,
 ) -> Result<Option<LogicalPlan>> {
     match proj_input.as_ref() {
@@ -1192,7 +1199,7 @@ fn push_extraction_pairs(
             // This handles: Extraction → Recovery(cols) → Filter → ... → TableScan
             // by pushing through the recovery projection AND the filter in one pass.
             if is_pure_extraction_projection(&merged_plan)
-                && let Some(pushed) = try_push_input(&merged_plan, alias_generator)?
+                && let Some(pushed) = try_push_input(&merged_plan, config)?
             {
                 return Ok(Some(pushed));
             }
@@ -1206,8 +1213,9 @@ fn push_extraction_pairs(
         _ => try_push_into_inputs(
             pairs,
             columns_needed,
+            recovery_exprs,
             proj_input.as_ref(),
-            alias_generator,
+            config,
         ),
     }
 }
@@ -1300,8 +1308,9 @@ fn route_to_inputs(
 fn try_push_into_inputs(
     pairs: &[(Expr, String)],
     columns_needed: &IndexSet<Column>,
+    recovery_exprs: &[Expr],
     node: &LogicalPlan,
-    alias_generator: &Arc<AliasGenerator>,
+    config: &dyn OptimizerConfig,
 ) -> Result<Option<LogicalPlan>> {
     let inputs = node.inputs();
     if inputs.is_empty() {
@@ -1310,8 +1319,8 @@ fn try_push_into_inputs(
 
     // Unnest may output a column with the same name but different value/type
     // than its input column. Name-based routing cannot distinguish those.
-    if matches!(node, LogicalPlan::Unnest(_)) {
-        return Ok(None);
+    if let LogicalPlan::Unnest(unnest) = node {
+        return try_push_through_unnest(pairs, recovery_exprs, unnest, config);
     }
 
     // SubqueryAlias remaps qualifiers between input and output.
@@ -1387,7 +1396,7 @@ fn try_push_into_inputs(
             // this input (e.g., through Filter → existing extraction projection).
             // This ensures the input's output schema is stable and won't change
             // when the TopDown pass later visits children.
-            match try_push_input(&proj_plan, alias_generator)? {
+            match try_push_input(&proj_plan, config)? {
                 Some(pushed) => new_inputs.push(pushed),
                 None => new_inputs.push(proj_plan),
             }
@@ -1408,6 +1417,215 @@ fn try_push_into_inputs(
     }
 
     Ok(Some(new_node))
+}
+
+/// Pushes extraction expressions on the elements an [`Unnest`] produces from
+/// a List through the `Unnest`, as a mapping of the List's elements.
+///
+/// A pair `f(u) AS a`, where `u` is the unnested elements of List `l` (one
+/// level deep) and no `recovery_exprs` read `u`, becomes the pair
+/// `map(l, x -> f(x)) AS a` below the `Unnest`, which then unnests `a`
+/// instead of `l`. `map` is a registered higher-order function declaring
+/// [`HigherOrderUDFImpl::list_element_map`] (`array_transform`): its result
+/// has the offsets and nulls of `l`, so unnesting it gives the rows of `f`
+/// on the unnested elements, and the extraction projection below reads only
+/// what `f` reads of each element. Pairs on columns the `Unnest` passes
+/// through move below it unchanged.
+///
+/// Returns `None`, leaving the `Unnest` a barrier, unless at least one pair
+/// maps a List's elements and every pair can move: a pair over a Struct
+/// unnest, a deeper or repeated List unnest, or more than one column stays,
+/// as does any pair when no such function is registered or it does not
+/// accept the List.
+///
+/// [`HigherOrderUDFImpl::list_element_map`]: datafusion_expr::HigherOrderUDFImpl::list_element_map
+///
+/// # Errors
+///
+/// Returns an error when the rebuilt projection or `Unnest` cannot be
+/// planned.
+fn try_push_through_unnest(
+    pairs: &[(Expr, String)],
+    recovery_exprs: &[Expr],
+    unnest: &Unnest,
+    config: &dyn OptimizerConfig,
+) -> Result<Option<LogicalPlan>> {
+    let input_schema = unnest.input.schema();
+    // Unlike `columns_needed`, this leaves out columns only the pairs read.
+    let recovery_columns = recovery_exprs
+        .iter()
+        .flat_map(|expr| expr.column_refs())
+        .collect::<std::collections::HashSet<_>>();
+    let mut mapped = vec![];
+    let mut kept = vec![];
+    for (expr, alias) in pairs {
+        let mut refs = expr.column_refs().into_iter();
+        let (Some(column), None) = (refs.next(), refs.next()) else {
+            return Ok(None);
+        };
+        let input = unnest.dependency_indices[unnest.schema.index_of_column(column)?];
+        let mut lists = unnest
+            .list_type_columns
+            .iter()
+            .filter(|(index, _)| *index == input);
+        match (lists.next(), lists.next()) {
+            _ if unnest.struct_type_columns.contains(&input) => return Ok(None),
+            (None, _) => kept.push((expr.clone(), alias.clone())),
+            (Some((_, list)), None)
+                if list.depth == 1 && !recovery_columns.contains(column) =>
+            {
+                mapped.push((expr, alias, column, input))
+            }
+            _ => return Ok(None),
+        }
+    }
+    if mapped.is_empty() || reads_mapped_lists_whole(unnest, &recovery_columns, &mapped) {
+        return Ok(None);
+    }
+    let Some(registry) = config.function_registry() else {
+        return Ok(None);
+    };
+    let mut names = registry
+        .higher_order_function_names()
+        .into_iter()
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    let Some((map, access)) = names.iter().find_map(|name| {
+        let function = registry.higher_order_function(name).ok()?;
+        let access = function.list_element_map()?;
+        Some((function, access))
+    }) else {
+        return Ok(None);
+    };
+    if access.list_arg.max(access.lambda_arg) != 1 || access.list_arg == access.lambda_arg
+    {
+        return Ok(None);
+    }
+
+    let mut lists = vec![];
+    for (expr, alias, column, input) in mapped {
+        let parameters = (0..=access.parameter)
+            .map(|i| format!("{alias}_{i}"))
+            .collect::<Vec<_>>();
+        let element = &parameters[access.parameter];
+        let body = expr
+            .clone()
+            .unalias_nested()
+            .data
+            .transform(|e| {
+                Ok(match e {
+                    Expr::Column(c) if &c == column => Transformed::yes(
+                        datafusion_expr::expr_fn::lambda_var(element.as_str()),
+                    ),
+                    e => Transformed::no(e),
+                })
+            })
+            .data()?;
+        let mut args = vec![
+            Expr::Column(Column::from(input_schema.qualified_field(input))),
+            datafusion_expr::expr_fn::lambda(parameters.iter().cloned(), body),
+        ];
+        if access.list_arg == 1 {
+            args.swap(0, 1);
+        }
+        let call =
+            Expr::HigherOrderFunction(HigherOrderFunction::new(Arc::clone(&map), args));
+        // The function may reject the List's type: the Unnest stays.
+        let Ok(call) = call
+            .resolve_lambda_variables(input_schema)
+            .data()
+            .and_then(|call| call.to_field(input_schema).map(|_| call))
+        else {
+            return Ok(None);
+        };
+        kept.push((call, alias.clone()));
+        lists.push((input, alias));
+    }
+
+    let mapped_inputs = lists.iter().map(|(input, _)| *input).collect::<Vec<_>>();
+    let columns = input_schema
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !mapped_inputs.contains(index))
+        .map(|(_, field)| Column::from(field))
+        .collect::<IndexSet<_>>();
+    let projection =
+        build_extraction_projection_impl(&kept, &columns, &unnest.input, input_schema)?;
+    // Exec and recursion columns may be unqualified: compare input indices.
+    let mapped_column = |column: &Column| {
+        input_schema
+            .maybe_index_of_column(column)
+            .is_some_and(|index| mapped_inputs.contains(&index))
+    };
+    let mut exec_columns = unnest
+        .exec_columns
+        .iter()
+        .filter(|column| !mapped_column(column))
+        .cloned()
+        .collect::<Vec<_>>();
+    exec_columns.extend(
+        lists
+            .into_iter()
+            .map(|(_, alias)| Column::new_unqualified(alias)),
+    );
+    let mut options = unnest.options.clone();
+    options
+        .recursions
+        .retain(|recursion| !mapped_column(&recursion.input_column));
+    let rebuilt = Unnest::try_new(
+        Arc::new(LogicalPlan::Projection(projection)),
+        exec_columns,
+        options,
+    )?;
+    let output_schema = rebuilt.schema.as_ref();
+    let missing = pairs
+        .iter()
+        .any(|(_, alias)| !output_schema.fields().iter().any(|f| f.name() == alias))
+        || recovery_columns
+            .iter()
+            .any(|column| !output_schema.has_column(column));
+    if missing {
+        return Ok(None);
+    }
+    Ok(Some(LogicalPlan::Unnest(rebuilt)))
+}
+
+/// Whether a column the `Unnest` passes through, read by `recovery_columns`,
+/// reads the same source column as a List that `mapped` would map, so the
+/// List is read whole anyway and mapping it reads no fewer leaves. SQL
+/// planning unnests a copy of the List (`l AS __unnest_placeholder(l)`) and
+/// keeps `l` beside it, so sources are traced through a projection below
+/// the `Unnest`.
+fn reads_mapped_lists_whole(
+    unnest: &Unnest,
+    recovery_columns: &std::collections::HashSet<&Column>,
+    mapped: &[(&Expr, &String, &Column, usize)],
+) -> bool {
+    let input_schema = unnest.input.schema();
+    let sources = |input: usize| match unnest.input.as_ref() {
+        LogicalPlan::Projection(projection) => projection.expr[input]
+            .column_refs()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+        _ => vec![Column::from(input_schema.qualified_field(input))],
+    };
+    let mapped_sources = mapped
+        .iter()
+        .flat_map(|(_, _, _, input)| sources(*input))
+        .collect::<Vec<_>>();
+    recovery_columns.iter().any(|column| {
+        unnest
+            .schema
+            .maybe_index_of_column(column)
+            .map(|output| unnest.dependency_indices[output])
+            .filter(|input| !mapped.iter().any(|(_, _, _, list)| list == input))
+            .is_some_and(|input| {
+                sources(input)
+                    .iter()
+                    .any(|source| mapped_sources.contains(source))
+            })
+    })
 }
 
 #[cfg(test)]
@@ -3599,6 +3817,228 @@ mod tests {
             TableScan: test projection=[c]
         "#);
 
+        Ok(())
+    }
+
+    /// A list element map over `List` arguments: `mock_map(list, x -> body)`.
+    /// Planning only; never invoked.
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct MockListMap {
+        signature: datafusion_expr::HigherOrderSignature,
+    }
+
+    impl datafusion_expr::HigherOrderUDFImpl for MockListMap {
+        fn name(&self) -> &str {
+            "mock_map"
+        }
+
+        fn signature(&self) -> &datafusion_expr::HigherOrderSignature {
+            &self.signature
+        }
+
+        fn lambda_parameters(
+            &self,
+            _step: usize,
+            fields: &[datafusion_expr::ValueOrLambda<
+                arrow::datatypes::FieldRef,
+                Option<arrow::datatypes::FieldRef>,
+            >],
+        ) -> Result<datafusion_expr::LambdaParametersProgress> {
+            let datafusion_expr::ValueOrLambda::Value(list) = &fields[0] else {
+                return datafusion_common::plan_err!("expected a list");
+            };
+            let arrow::datatypes::DataType::List(element) = list.data_type() else {
+                return datafusion_common::plan_err!("expected a list");
+            };
+            Ok(datafusion_expr::LambdaParametersProgress::Complete(vec![
+                vec![Arc::clone(element)],
+            ]))
+        }
+
+        fn list_element_lambda(&self) -> Option<datafusion_expr::ListElementLambda> {
+            Some(datafusion_expr::ListElementLambda {
+                list_arg: 0,
+                lambda_arg: 1,
+                parameter: 0,
+            })
+        }
+
+        fn list_element_map(&self) -> Option<datafusion_expr::ListElementLambda> {
+            self.list_element_lambda()
+        }
+
+        fn return_field_from_args(
+            &self,
+            args: datafusion_expr::HigherOrderReturnFieldArgs,
+        ) -> Result<arrow::datatypes::FieldRef> {
+            let datafusion_expr::ValueOrLambda::Lambda(lambda) = &args.arg_fields[1]
+            else {
+                return datafusion_common::plan_err!("expected a lambda");
+            };
+            Ok(Arc::new(arrow::datatypes::Field::new(
+                "",
+                arrow::datatypes::DataType::new_list(lambda.data_type().clone(), true),
+                true,
+            )))
+        }
+
+        fn invoke_with_args(
+            &self,
+            _args: datafusion_expr::HigherOrderFunctionArgs,
+        ) -> Result<datafusion_expr::ColumnarValue> {
+            datafusion_common::not_impl_err!("mock_map is for planning only")
+        }
+    }
+
+    /// An [`OptimizerContext`] whose registry holds [`MockListMap`].
+    struct ListMapContext {
+        inner: OptimizerContext,
+        registry: datafusion_expr::registry::MemoryFunctionRegistry,
+    }
+
+    impl ListMapContext {
+        fn new() -> Result<Self> {
+            use datafusion_expr::registry::FunctionRegistry;
+            let mut registry = datafusion_expr::registry::MemoryFunctionRegistry::new();
+            registry.register_higher_order_function(Arc::new(
+                datafusion_expr::HigherOrderUDF::new_from_impl(MockListMap {
+                    signature: datafusion_expr::HigherOrderSignature::variadic_any(
+                        Volatility::Immutable,
+                    ),
+                }),
+            ))?;
+            Ok(Self {
+                inner: OptimizerContext::new(),
+                registry,
+            })
+        }
+    }
+
+    impl OptimizerConfig for ListMapContext {
+        fn query_execution_start_time(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+            self.inner.query_execution_start_time()
+        }
+
+        fn alias_generator(&self) -> &Arc<AliasGenerator> {
+            self.inner.alias_generator()
+        }
+
+        fn options(&self) -> Arc<datafusion_common::config::ConfigOptions> {
+            self.inner.options()
+        }
+
+        fn function_registry(
+            &self,
+        ) -> Option<&dyn datafusion_expr::registry::FunctionRegistry> {
+            Some(&self.registry)
+        }
+    }
+
+    /// `t(id, l: List<Struct<a, b>>)` with `l` unnested.
+    fn unnested_list_of_structs() -> Result<LogicalPlanBuilder> {
+        use arrow::datatypes::{DataType, Field, Fields, Schema};
+        let element = DataType::Struct(Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("l", DataType::new_list(element, true), true),
+        ]);
+        datafusion_expr::logical_plan::table_scan(Some("t"), &schema, None)?
+            .unnest_column("l")
+    }
+
+    /// Runs leaf extraction, leaf pushdown and projection pruning on `plan`
+    /// under `config`.
+    fn push_leaves(plan: LogicalPlan, config: &dyn OptimizerConfig) -> Result<String> {
+        let optimizer = Optimizer::with_rules(vec![
+            Arc::new(ExtractLeafExpressions::new()),
+            Arc::new(PushDownLeafProjections::new()),
+            Arc::new(OptimizeProjections::new()),
+        ]);
+        Ok(format!("{}", optimizer.optimize(plan, config, |_, _| {})?))
+    }
+
+    /// A leaf expression on unnested List elements moves below the Unnest as
+    /// a list element map of the List, which the Unnest then unnests.
+    #[test]
+    fn test_push_projection_through_unnest_as_list_element_map() -> Result<()> {
+        let plan = unnested_list_of_structs()?
+            .project(vec![get_field_like(col("l"), "a"), col("t.id")])?
+            .build()?;
+        insta::assert_snapshot!(push_leaves(plan, &ListMapContext::new()?)?, @r#"
+        Projection: __datafusion_extracted_1 AS get_field_like(l,Utf8("a")), t.id
+          Unnest: lists[__datafusion_extracted_1|depth=1] structs[]
+            Projection: mock_map(t.l, (__datafusion_extracted_1_0) -> get_field_like(__datafusion_extracted_1_0, Utf8("a"))) AS __datafusion_extracted_1, t.id
+              TableScan: t projection=[id, l]
+        "#);
+        Ok(())
+    }
+
+    /// A filter's leaf expression on unnested List elements moves below the
+    /// Unnest the same way.
+    #[test]
+    fn test_push_filter_through_unnest_as_list_element_map() -> Result<()> {
+        let plan = unnested_list_of_structs()?
+            .filter(get_field_like(col("l"), "a").eq(lit(1u32)))?
+            .project(vec![col("t.id")])?
+            .build()?;
+        insta::assert_snapshot!(push_leaves(plan, &ListMapContext::new()?)?, @r#"
+        Projection: t.id
+          Filter: __datafusion_extracted_1 = UInt32(1)
+            Unnest: lists[__datafusion_extracted_1|depth=1] structs[]
+              Projection: mock_map(t.l, (__datafusion_extracted_1_0) -> get_field_like(__datafusion_extracted_1_0, Utf8("a"))) AS __datafusion_extracted_1, t.id
+                TableScan: t projection=[id, l]
+        "#);
+        Ok(())
+    }
+
+    /// The Unnest stays a barrier when the unnested elements, or the List
+    /// they come from, are also read whole, so mapping them would read no
+    /// fewer leaves, and when no list element map is registered.
+    #[test]
+    fn test_unnest_stays_a_barrier_without_benefit_or_map() -> Result<()> {
+        let whole = unnested_list_of_structs()?
+            .project(vec![get_field_like(col("l"), "a"), col("l")])?
+            .build()?;
+        insta::assert_snapshot!(push_leaves(whole, &ListMapContext::new()?)?, @r#"
+        Projection: get_field_like(l, Utf8("a")), l
+          Unnest: lists[t.l|depth=1] structs[]
+            TableScan: t projection=[l]
+        "#);
+
+        // SQL's shape: a copy of the List is unnested beside the List.
+        use arrow::datatypes::{DataType, Field, Fields, Schema};
+        let element = DataType::Struct(Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+        let schema = Schema::new(vec![Field::new(
+            "l",
+            DataType::new_list(element, true),
+            true,
+        )]);
+        let copied = datafusion_expr::logical_plan::table_scan(Some("t"), &schema, None)?
+            .project(vec![col("t.l").alias("p"), col("t.l")])?
+            .unnest_column("p")?
+            .project(vec![get_field_like(col("p"), "a"), col("t.l")])?
+            .build()?;
+        insta::assert_snapshot!(push_leaves(copied, &ListMapContext::new()?)?, @r#"
+        Projection: get_field_like(p, Utf8("a")), t.l
+          Unnest: lists[p|depth=1] structs[]
+            Projection: t.l AS p, t.l
+              TableScan: t projection=[l]
+        "#);
+
+        let unregistered = unnested_list_of_structs()?
+            .project(vec![get_field_like(col("l"), "a"), col("t.id")])?
+            .build()?;
+        insta::assert_snapshot!(push_leaves(unregistered, &OptimizerContext::new())?, @r#"
+        Projection: get_field_like(l, Utf8("a")), t.id
+          Unnest: lists[t.l|depth=1] structs[]
+            TableScan: t projection=[id, l]
+        "#);
         Ok(())
     }
 }

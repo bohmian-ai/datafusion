@@ -127,6 +127,12 @@ impl HigherOrderUDFImpl for ArrayTransform {
         })
     }
 
+    /// Element `i` of the result is the lambda's value for element `i`, with
+    /// the list's offsets and nulls.
+    fn list_element_map(&self) -> Option<ListElementLambda> {
+        self.list_element_lambda()
+    }
+
     fn return_field_from_args(
         &self,
         args: HigherOrderReturnFieldArgs,

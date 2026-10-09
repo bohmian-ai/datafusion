@@ -66,8 +66,9 @@ pub(crate) struct ParquetReadPlan {
     /// Using a `ProjectionMask` directly (rather than raw indices) prevents
     /// bugs from accidentally mixing up root vs leaf indices.
     pub projection_mask: ProjectionMask,
-    /// The projected Arrow schema containing only the columns/fields required
-    /// Struct types are pruned to include only the accessed sub-fields
+    /// The projected Arrow schema containing only the columns/fields required.
+    /// Struct types, including Structs inside Lists, are pruned to include
+    /// only the accessed sub-fields
     pub projected_schema: SchemaRef,
 }
 
@@ -1041,7 +1042,9 @@ fn unique_field<'a>(fields: &'a Fields, name: &str) -> Option<(usize, &'a FieldR
 pub(crate) struct PushdownColumns {
     /// Sorted, unique column indices into the file schema required to evaluate
     /// the filter expression. Must be in ascending order for correct schema
-    /// projection matching. Does not include struct columns accessed via `get_field`.
+    /// projection matching. Does not include struct columns accessed via
+    /// `get_field`, nor List columns read through element access or list
+    /// element lambdas.
     pub(crate) required_columns: Vec<usize>,
     /// Struct field accesses via `get_field`. Each entry records the root struct
     /// column index and the field path being accessed.
