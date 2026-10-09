@@ -772,7 +772,8 @@ pub trait HigherOrderUDFImpl: Debug + DynEq + DynHash + Send + Sync + Any {
     /// When `Some`, each value of `parameter` of the lambda at `lambda_arg`
     /// is one element of the List at `list_arg`, unchanged, and the function
     /// reads those elements nowhere else; it may still read the List's
-    /// offsets and nulls. Readers use this to decode only the element fields
+    /// offsets and nulls. The parameter's field is the List's element field,
+    /// as [`Self::lambda_parameters`] reports it. Readers use this to decode only the element fields
     /// the lambda body needs, and schema adapters to narrow a List cast to
     /// the parameter. `array_transform` qualifies; `array_filter` does not,
     /// since it returns the elements themselves.

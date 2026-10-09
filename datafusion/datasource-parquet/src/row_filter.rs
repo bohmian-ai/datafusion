@@ -301,6 +301,7 @@ pub(crate) fn build_parquet_read_plan(
             &required_columns.required_columns,
             &required_columns.struct_field_accesses,
             &required_columns.cast_accesses,
+            &required_columns.leaf_range_accesses,
         )
     };
 

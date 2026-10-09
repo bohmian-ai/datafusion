@@ -30,6 +30,10 @@ use datafusion::common::Result;
 use datafusion::datasource::listing::{
     ListingTable, ListingTableConfig, ListingTableConfigExt,
 };
+use datafusion::functions::core::expr_fn::get_field;
+use datafusion::functions_nested::expr_fn::{array_element, array_transform};
+use datafusion::functions_variant::VARIANT_GET_TEXT;
+use datafusion::logical_expr::{LogicalPlan, col, lambda, lambda_var, lit};
 use datafusion::prelude::SessionContext;
 use datafusion_datasource::ListingTableUrl;
 use datafusion_execution::object_store::ObjectStoreUrl;
@@ -370,7 +374,16 @@ fn bytes_scanned(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> us
 
 /// Runs `sql` and returns its first column as strings and the bytes scanned.
 async fn run(ctx: &SessionContext, sql: &str) -> Result<(Vec<Option<String>>, usize)> {
-    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+    let plan = ctx.sql(sql).await?.into_unoptimized_plan();
+    run_plan(ctx, &plan).await
+}
+
+/// Runs `plan` and returns its first column as strings and the bytes scanned.
+async fn run_plan(
+    ctx: &SessionContext,
+    plan: &LogicalPlan,
+) -> Result<(Vec<Option<String>>, usize)> {
+    let plan = ctx.state().create_physical_plan(plan).await?;
     let batches =
         datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx()).await?;
     let column = arrow::compute::concat(
@@ -388,9 +401,10 @@ async fn run(ctx: &SessionContext, sql: &str) -> Result<(Vec<Option<String>>, us
     Ok((values, bytes_scanned(&plan)))
 }
 
-/// A file whose Variant `v` (and `s.v`) shreds `{a: Int64, b: Utf8}`, with a
-/// large distinct `b` per row, written with the Variant extension type as a
-/// Variant writer does, and registered as `t` with canonical Variant columns.
+/// A file whose Variant `v` (and `s.v`, and `v` in the one element of each
+/// row's `l`) shreds `{a: Int64, b: Utf8}`, with a large distinct `b` per
+/// row, written with the Variant extension type as a Variant writer does,
+/// and registered as `t` with canonical Variant columns.
 async fn object_shredded_table() -> SessionContext {
     use parquet_variant_compute::VariantType;
 
@@ -416,8 +430,16 @@ async fn object_shredded_table() -> SessionContext {
         vec![Arc::clone(&v)],
         None,
     ));
-    let schema = Arc::new(Schema::new(vec![v_field, s_field]));
-    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![v, s]).unwrap();
+    let l_element = Arc::new(Field::new("item", s_field.data_type().clone(), true));
+    let l: ArrayRef = Arc::new(ListArray::new(
+        Arc::clone(&l_element),
+        OffsetBuffer::from_lengths(std::iter::repeat_n(1, rows)),
+        Arc::clone(&s),
+        None,
+    ));
+    let l_field = Field::new("l", DataType::List(l_element), true);
+    let schema = Arc::new(Schema::new(vec![v_field, s_field, l_field]));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![v, s, l]).unwrap();
 
     let mut out = BytesMut::new().writer();
     let mut writer = ArrowWriter::try_new(&mut out, schema, None).unwrap();
@@ -432,13 +454,11 @@ async fn object_shredded_table() -> SessionContext {
         .await
         .unwrap();
 
+    let s_type = DataType::Struct(Fields::from(vec![variant_field("v")]));
     let table_schema = Arc::new(Schema::new(vec![
         variant_field("v"),
-        Field::new(
-            "s",
-            DataType::Struct(Fields::from(vec![variant_field("v")])),
-            true,
-        ),
+        Field::new("s", s_type.clone(), true),
+        Field::new("l", DataType::new_list(s_type, true), true),
     ]));
     let ctx = SessionContext::new();
     let url = ObjectStoreUrl::parse("memory://").unwrap();
@@ -475,6 +495,28 @@ async fn shredded_paths_read_only_their_leaves() -> Result<()> {
     assert!(
         nested * 10 < whole,
         "nested leaf read {nested} bytes, whole read {whole}"
+    );
+
+    let (values, listed) = run(&ctx, "SELECT l[1]['v'] ->> 'a' FROM t").await?;
+    assert_eq!(values, expected);
+    assert!(
+        listed * 10 < whole,
+        "leaf below a List read {listed} bytes, whole read {whole}"
+    );
+
+    // array_transform(l, x -> x['v'] ->> 'a')[1]: SQL cannot yet bind a
+    // lambda parameter over a table column.
+    let body = VARIANT_GET_TEXT.call(vec![get_field(lambda_var("x"), "v"), lit("a")]);
+    let table = ctx.table("t").await?;
+    let transform = array_element(array_transform(col("l"), lambda(["x"], body)), lit(1))
+        .resolve_lambda_variables(table.schema())?
+        .data;
+    let plan = table.select(vec![transform])?.into_unoptimized_plan();
+    let (values, transformed) = run_plan(&ctx, &plan).await?;
+    assert_eq!(values, expected);
+    assert!(
+        transformed * 10 < whole,
+        "leaf in a lambda over a List read {transformed} bytes, whole read {whole}"
     );
 
     ctx.sql("SET datafusion.execution.parquet.pushdown_filters = true")

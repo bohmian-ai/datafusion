@@ -145,6 +145,38 @@ explain analyze select s, s['y'] from full_schema;
 ----
 Plan with Metrics DataSourceExec: <slt:ignore>metrics=[output_rows=3, <slt:ignore>bytes_scanned=219.0 B<slt:ignore>]
 
+# Element access below a List reads only the element fields it selects:
+# `events[2]['x']` reads `x` alone, fewer bytes than `events` above, from
+# both tables, although each converts `events` to its declared type.
+query II
+SELECT id, events[2]['x'] FROM narrow ORDER BY id;
+----
+1 NULL
+2 21
+3 NULL
+
+query TT
+explain analyze select events[2]['x'] from narrow;
+----
+Plan with Metrics DataSourceExec: <slt:ignore>metrics=[output_rows=3, <slt:ignore>bytes_scanned=87.0 B<slt:ignore>]
+
+query TT
+explain analyze select events[2]['x'] from full_schema;
+----
+Plan with Metrics DataSourceExec: <slt:ignore>metrics=[output_rows=3, <slt:ignore>bytes_scanned=87.0 B<slt:ignore>]
+
+# The whole element reads every field the table declares, as `events` does.
+query ?
+SELECT events[1] FROM narrow ORDER BY id;
+----
+{x: 10, y: a1, z: NULL}
+{x: 20, y: b1, z: NULL}
+NULL
+
+query TT
+explain analyze select events[1] from narrow;
+----
+Plan with Metrics DataSourceExec: <slt:ignore>metrics=[output_rows=3, <slt:ignore>bytes_scanned=172.0 B<slt:ignore>]
 
 # `SELECT *` goes through the same clipped read as an explicit projection.
 query I??

@@ -20,6 +20,7 @@
 //! and [`replace_columns_with_literals`].
 
 use std::borrow::Borrow;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
@@ -38,7 +39,7 @@ use datafusion_physical_expr::PhysicalExprSimplifier;
 use datafusion_physical_expr::expressions::Literal;
 use datafusion_physical_expr::projection::{ProjectionExprs, Projector};
 use datafusion_physical_expr::{
-    ScalarFunctionExpr,
+    HigherOrderFunctionExpr, ScalarFunctionExpr,
     expressions::{self, CastExpr, Column},
 };
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
@@ -274,7 +275,7 @@ impl PhysicalExprAdapter for DefaultPhysicalExprAdapter {
         let mut rewriter = DefaultPhysicalExprAdapterRewriter {
             logical_file_schema: Arc::clone(&self.logical_file_schema),
             physical_file_schema: Arc::clone(&self.physical_file_schema),
-            generated_struct_casts: HashMap::new(),
+            generated_casts: HashMap::new(),
         };
         expr.transform(|expr| rewriter.rewrite_expr(Arc::clone(&expr)))
             .data()
@@ -284,13 +285,14 @@ impl PhysicalExprAdapter for DefaultPhysicalExprAdapter {
 struct DefaultPhysicalExprAdapterRewriter {
     logical_file_schema: SchemaRef,
     physical_file_schema: SchemaRef,
-    // A fresh map is created for each `rewrite()` call. Tracking relies on
-    // bottom-up `transform` traversal: a generated child cast is recorded before
-    // its parent `get_field` sees the same Arc allocation. Owned Arc clones keep
+    // Struct and List casts this adapter generated. A fresh map is created
+    // for each `rewrite()` call. Tracking relies on bottom-up `transform`
+    // traversal: a generated child cast is recorded before its parent
+    // accessor sees the same Arc allocation. Owned Arc clones keep
     // recorded allocations alive even after removal from the tree, preventing
     // pointer-address reuse. Keeping provenance here avoids adding markers to
     // expression types or threading it through rewrite results.
-    generated_struct_casts: HashMap<*const (), Arc<dyn PhysicalExpr>>,
+    generated_casts: HashMap<*const (), Arc<dyn PhysicalExpr>>,
 }
 
 /// Outcome of walking a `get_field` key path through nested struct fields.
@@ -388,13 +390,37 @@ impl DefaultPhysicalExprAdapterRewriter {
         &mut self,
         expr: Arc<dyn PhysicalExpr>,
     ) -> Result<Transformed<Arc<dyn PhysicalExpr>>> {
+        if let Some(column) = expr.downcast_ref::<Column>() {
+            let transformed = self.rewrite_column(Arc::clone(&expr), column)?;
+            self.record_generated_cast(&transformed.data);
+            return Ok(transformed);
+        }
+        self.narrow_expr(expr)
+    }
+
+    /// Narrow the casts this adapter generated below accessors in `expr`,
+    /// one node of a bottom-up walk. Columns are left alone, so the walk may
+    /// revisit an expression whose columns were already rewritten.
+    fn narrow_expr(
+        &mut self,
+        expr: Arc<dyn PhysicalExpr>,
+    ) -> Result<Transformed<Arc<dyn PhysicalExpr>>> {
         if let Some(transformed) = self.try_rewrite_struct_field_access(&expr)? {
             return Ok(Transformed::yes(transformed));
         }
 
         if let Some(transformed) = self.try_narrow_struct_cast(&expr)? {
             // A narrowed Struct cast may be accessed by another get_field.
-            self.record_generated_struct_cast(&transformed);
+            self.record_generated_cast(&transformed);
+            return Ok(Transformed::yes(transformed));
+        }
+
+        if let Some(transformed) = self.try_narrow_list_element_cast(&expr)? {
+            self.record_generated_cast(&transformed);
+            return Ok(Transformed::yes(transformed));
+        }
+
+        if let Some(transformed) = self.try_narrow_list_element_lambda(&expr)? {
             return Ok(Transformed::yes(transformed));
         }
 
@@ -402,21 +428,19 @@ impl DefaultPhysicalExprAdapterRewriter {
             return Ok(Transformed::yes(transformed));
         }
 
-        if let Some(column) = expr.downcast_ref::<Column>() {
-            let transformed = self.rewrite_column(Arc::clone(&expr), column)?;
-            self.record_generated_struct_cast(&transformed.data);
-            return Ok(transformed);
-        }
-
         Ok(Transformed::no(expr))
     }
 
-    fn record_generated_struct_cast(&mut self, expr: &Arc<dyn PhysicalExpr>) {
-        if expr
-            .downcast_ref::<CastExpr>()
-            .is_some_and(|cast| matches!(cast.cast_type(), DataType::Struct(_)))
-        {
-            self.generated_struct_casts
+    /// Track a Struct or List cast this adapter generated, so accessors above
+    /// it may narrow it; explicit casts are never narrowed.
+    fn record_generated_cast(&mut self, expr: &Arc<dyn PhysicalExpr>) {
+        if expr.downcast_ref::<CastExpr>().is_some_and(|cast| {
+            matches!(
+                cast.cast_type(),
+                DataType::Struct(_) | DataType::List(_) | DataType::LargeList(_)
+            )
+        }) {
+            self.generated_casts
                 .insert(Arc::as_ptr(expr).cast::<()>(), Arc::clone(expr));
         }
     }
@@ -477,7 +501,7 @@ impl DefaultPhysicalExprAdapterRewriter {
             return Ok(None);
         };
         if !self
-            .generated_struct_casts
+            .generated_casts
             .contains_key(&Arc::as_ptr(source_expr).cast::<()>())
         {
             return Ok(None);
@@ -604,10 +628,161 @@ impl DefaultPhysicalExprAdapterRewriter {
         ))))
     }
 
+    /// Rewrite `array_element(cast(l AS List<E>), i)`, or any function
+    /// declaring [`ScalarUDFImpl::list_element_access`], into
+    /// `cast(array_element(l, i) AS E)`.
+    ///
+    /// A List cast converts every element; selecting one element and
+    /// converting only it gives the same value, and an element that is a
+    /// Struct keeps a generated cast that a `get_field` above may narrow
+    /// further (see [`Self::try_narrow_struct_cast`]). Only List casts this
+    /// adapter generated are moved.
+    ///
+    /// Unlike a Struct cast, no element conversion is excluded: a List cast
+    /// converts its compacted values with the same element conversion the
+    /// moved cast applies to the selected elements, which are a subset of
+    /// those values at the same nesting. Any all-null shortcut the List
+    /// cast takes is therefore taken for the selected elements too.
+    ///
+    /// [`ScalarUDFImpl::list_element_access`]: datafusion_expr::ScalarUDFImpl::list_element_access
+    fn try_narrow_list_element_cast(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+    ) -> Result<Option<Arc<dyn PhysicalExpr>>> {
+        let Some(function) = expr.downcast_ref::<ScalarFunctionExpr>() else {
+            return Ok(None);
+        };
+        let Some(source) = function.list_element_access() else {
+            return Ok(None);
+        };
+        let Some(cast) = self.generated_list_cast(&function.args()[source])? else {
+            return Ok(None);
+        };
+        let mut args = function.args().to_vec();
+        args[source] = Arc::clone(cast.expr());
+        let Ok(extracted) = ScalarFunctionExpr::try_new(
+            Arc::new(function.fun().clone()),
+            args,
+            &self.physical_file_schema,
+            Arc::new(function.config_options().clone()),
+        ) else {
+            return Ok(None);
+        };
+        let extracted = Arc::new(extracted) as Arc<dyn PhysicalExpr>;
+        let logical_return_field = expr.return_field(&self.logical_file_schema)?;
+        if extracted.return_field(&self.physical_file_schema)? == logical_return_field {
+            return Ok(Some(extracted));
+        }
+        Ok(Some(Arc::new(CastExpr::new_with_target_field(
+            extracted,
+            logical_return_field,
+            Some(cast.cast_options().clone()),
+        ))))
+    }
+
+    /// Rewrite `array_transform(cast(l AS List<E>), x -> body(x))`, or any
+    /// function declaring [`HigherOrderUDFImpl::list_element_lambda`], into
+    /// `array_transform(l, x -> body(cast(x AS E)))`, then narrow the casts
+    /// in the body as anywhere else.
+    ///
+    /// As for [`Self::try_narrow_list_element_cast`], converting each element
+    /// the lambda reads gives the same value as converting the List first.
+    /// Moving the conversion into the lambda lets an accessor in the body
+    /// narrow it (`x['f']` converts only `f`), so a reader decodes only the
+    /// leaves the body reads. The element parameter is rebound to the file's
+    /// element field with
+    /// [`HigherOrderFunctionExpr::rebind_list_element`]. The rewrite is kept
+    /// only when the function keeps its logical return field.
+    ///
+    /// [`HigherOrderUDFImpl::list_element_lambda`]: datafusion_expr::HigherOrderUDFImpl::list_element_lambda
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the data type of the function's List argument
+    /// cannot be computed, or narrowing the body fails.
+    fn try_narrow_list_element_lambda(
+        &mut self,
+        expr: &Arc<dyn PhysicalExpr>,
+    ) -> Result<Option<Arc<dyn PhysicalExpr>>> {
+        let Some(function) = expr.downcast_ref::<HigherOrderFunctionExpr>() else {
+            return Ok(None);
+        };
+        let Some(list) = function
+            .fun()
+            .list_element_lambda()
+            .and_then(|access| function.args().get(access.list_arg))
+        else {
+            return Ok(None);
+        };
+        let Some(cast) = self.generated_list_cast(list)? else {
+            return Ok(None);
+        };
+        let (DataType::List(element) | DataType::LargeList(element)) = cast.cast_type()
+        else {
+            return Ok(None);
+        };
+        let element_casts = RefCell::new(Vec::new());
+        let bind = |variable| {
+            let element_cast = Arc::new(CastExpr::new_with_target_field(
+                variable,
+                Arc::clone(element),
+                Some(cast.cast_options().clone()),
+            )) as Arc<dyn PhysicalExpr>;
+            element_casts.borrow_mut().push(Arc::clone(&element_cast));
+            Ok(element_cast)
+        };
+        // A function may reject the file's element type: keep the List cast.
+        let Ok(Some(rebound)) = function.rebind_list_element(
+            Arc::clone(cast.expr()),
+            &self.physical_file_schema,
+            &bind,
+        ) else {
+            return Ok(None);
+        };
+        for element_cast in element_casts.into_inner() {
+            self.record_generated_cast(&element_cast);
+        }
+        let narrowed = (Arc::new(rebound) as Arc<dyn PhysicalExpr>)
+            .transform(|expr| self.narrow_expr(expr))
+            .data()?;
+        if narrowed.return_field(&self.physical_file_schema)?
+            != expr.return_field(&self.logical_file_schema)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(narrowed))
+    }
+
+    /// `expr` as a List-to-List cast this adapter generated, whose element
+    /// conversion may move onto the elements an accessor reads.
+    fn generated_list_cast<'a>(
+        &self,
+        expr: &'a Arc<dyn PhysicalExpr>,
+    ) -> Result<Option<&'a CastExpr>> {
+        let Some(cast) = expr.downcast_ref::<CastExpr>() else {
+            return Ok(None);
+        };
+        if !self
+            .generated_casts
+            .contains_key(&Arc::as_ptr(expr).cast::<()>())
+        {
+            return Ok(None);
+        }
+        let is_list = |data_type: &DataType| {
+            matches!(data_type, DataType::List(_) | DataType::LargeList(_))
+        };
+        if !is_list(&cast.expr().data_type(&self.physical_file_schema)?)
+            || !is_list(cast.cast_type())
+        {
+            return Ok(None);
+        }
+        Ok(Some(cast))
+    }
+
     /// Pass a file's field straight to a function argument declared with
     /// [`InputFieldRequirement::accepts_any_layout`].
     ///
-    /// Only Struct casts this adapter generated, whose source and target carry
+    /// Only casts this adapter generated, whose source and target carry
     /// the same extension type (for example a shredded and an unshredded
     /// Variant), are dropped. The function is rebuilt over the file's fields
     /// and the rewrite is kept only when the function accepts them, declares
@@ -629,7 +804,7 @@ impl DefaultPhysicalExprAdapterRewriter {
                 continue;
             };
             if !self
-                .generated_struct_casts
+                .generated_casts
                 .contains_key(&Arc::as_ptr(arg).cast::<()>())
             {
                 continue;
@@ -977,8 +1152,9 @@ impl BatchAdapter {
 mod tests {
     use super::*;
     use arrow::array::{
-        Array, BooleanArray, GenericListArray, Int32Array, Int64Array, RecordBatch,
-        RecordBatchOptions, StringArray, StringViewArray, StructArray, record_batch,
+        Array, ArrayRef, BooleanArray, GenericListArray, Int32Array, Int64Array,
+        RecordBatch, RecordBatchOptions, StringArray, StringViewArray, StructArray,
+        record_batch,
     };
     use arrow::datatypes as arrow_schema;
     use arrow::datatypes::{Field, Fields, Schema};
@@ -1765,7 +1941,7 @@ mod tests {
         let rewriter = DefaultPhysicalExprAdapterRewriter {
             logical_file_schema: Arc::new(logical_schema),
             physical_file_schema: Arc::new(physical_schema),
-            generated_struct_casts: HashMap::new(),
+            generated_casts: HashMap::new(),
         };
 
         // Test that when a field exists in physical schema, it returns None
@@ -2864,5 +3040,298 @@ mod tests {
         let cast_expr = assert_cast_expr(&rewritten);
         assert_cast_input_column(cast_expr, "a", 1);
         assert_eq!(cast_expr.target_field().data_type(), &DataType::Int64);
+    }
+
+    /// `l: List<Struct<x, pad: Utf8>>` with `x` of type `x_type` in an element
+    /// field named `element_name`.
+    fn list_of_struct_schema(x_type: DataType, element_name: &str) -> SchemaRef {
+        let element = DataType::Struct(
+            vec![
+                Field::new("x", x_type, true),
+                Field::new("pad", DataType::Utf8, true),
+            ]
+            .into(),
+        );
+        Arc::new(Schema::new(vec![Field::new(
+            "l",
+            DataType::List(Arc::new(Field::new(element_name, element, true))),
+            true,
+        )]))
+    }
+
+    /// `array_element(l, 1)`, then `['x']` when `field` is set, over `schema`.
+    fn list_element_expr(schema: &Schema, field: bool) -> Result<Arc<dyn PhysicalExpr>> {
+        let config = Arc::new(datafusion_common::config::ConfigOptions::default());
+        let element = Arc::new(ScalarFunctionExpr::try_new(
+            datafusion_functions_nested::extract::array_element_udf(),
+            vec![
+                Arc::new(Column::new("l", 0)),
+                Arc::new(Literal::new(ScalarValue::Int64(Some(1)))),
+            ],
+            schema,
+            Arc::clone(&config),
+        )?) as Arc<dyn PhysicalExpr>;
+        if !field {
+            return Ok(element);
+        }
+        Ok(Arc::new(ScalarFunctionExpr::try_new(
+            Arc::new(datafusion_expr::ScalarUDF::from(GetFieldFunc::new())),
+            vec![element, Arc::new(Literal::new(ScalarValue::from("x")))],
+            schema,
+            config,
+        )?))
+    }
+
+    /// `array_transform(l, x -> x)`, or `x -> x['x']` when `field` is set,
+    /// over `schema`.
+    fn list_transform_expr(
+        schema: &Schema,
+        field: bool,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        let config = Arc::new(datafusion_common::config::ConfigOptions::default());
+        let DataType::List(element) = schema.field(0).data_type() else {
+            unreachable!("l is a List")
+        };
+        let x = Arc::new(expressions::LambdaVariable::new(
+            1,
+            Arc::new(element.as_ref().clone().with_name("x")),
+        )) as Arc<dyn PhysicalExpr>;
+        let body = if field {
+            Arc::new(ScalarFunctionExpr::try_new(
+                Arc::new(datafusion_expr::ScalarUDF::from(GetFieldFunc::new())),
+                vec![x, Arc::new(Literal::new(ScalarValue::from("x")))],
+                schema,
+                Arc::clone(&config),
+            )?)
+        } else {
+            x
+        };
+        Ok(Arc::new(HigherOrderFunctionExpr::try_new_with_schema(
+            datafusion_functions_nested::array_transform::array_transform_higher_order_function(),
+            vec![
+                Arc::new(Column::new("l", 0)),
+                Arc::new(expressions::LambdaExpr::try_new(vec!["x".to_string()], body)?),
+            ],
+            schema,
+            config,
+        )?))
+    }
+
+    /// Whether `expr` converts a whole List anywhere.
+    fn has_list_cast(expr: &Arc<dyn PhysicalExpr>) -> bool {
+        expr.exists(|node| {
+            Ok(node.downcast_ref::<CastExpr>().is_some_and(|cast| {
+                matches!(cast.cast_type(), DataType::List(_) | DataType::LargeList(_))
+            }))
+        })
+        .unwrap()
+    }
+
+    /// Rewrites `expr` with the adapter, asserts that no whole List is
+    /// converted any more, and evaluates it and, for comparison, `expr` over
+    /// the adapter's conversion of the whole column `l`. Returns both
+    /// outcomes.
+    fn evaluate_narrowed_and_whole(
+        logical_schema: &SchemaRef,
+        physical_schema: &SchemaRef,
+        expr: Arc<dyn PhysicalExpr>,
+        batch: &RecordBatch,
+    ) -> Result<(Result<ArrayRef>, Result<ArrayRef>)> {
+        let adapter = DefaultPhysicalExprAdapterFactory
+            .create(Arc::clone(logical_schema), Arc::clone(physical_schema))?;
+        let whole_column = adapter.rewrite(Arc::new(Column::new("l", 0)))?;
+        assert!(has_list_cast(&whole_column), "{whole_column}");
+        let original = Arc::clone(&expr)
+            .transform(|node| {
+                Ok(if node.downcast_ref::<Column>().is_some() {
+                    Transformed::yes(Arc::clone(&whole_column))
+                } else {
+                    Transformed::no(node)
+                })
+            })
+            .data()?;
+        let evaluate = |expr: &Arc<dyn PhysicalExpr>| {
+            expr.evaluate(batch)?.into_array(batch.num_rows())
+        };
+        let rewritten = adapter.rewrite(expr)?;
+        assert!(!has_list_cast(&rewritten), "{rewritten}");
+        Ok((evaluate(&rewritten), evaluate(&original)))
+    }
+
+    /// `l[1]` and `l[1]['x']` over a converted List convert only the selected
+    /// element, or only its field, as do `array_transform(l, x -> x)` and
+    /// `x -> x['x']` for each element, and give the whole-List conversion's
+    /// values: for a widened field, for a renamed element field, over null
+    /// and empty Lists, null elements and null fields.
+    #[test]
+    fn test_narrow_list_cast_to_element_access() -> Result<()> {
+        use arrow::buffer::{NullBuffer, OffsetBuffer};
+
+        for (physical_schema, logical_schema) in [
+            (
+                list_of_struct_schema(DataType::Int32, "item"),
+                list_of_struct_schema(DataType::Int64, "item"),
+            ),
+            (
+                list_of_struct_schema(DataType::Int32, "element"),
+                list_of_struct_schema(DataType::Int32, "item"),
+            ),
+        ] {
+            let DataType::List(element) = physical_schema.field(0).data_type() else {
+                unreachable!()
+            };
+            let DataType::Struct(fields) = element.data_type() else {
+                unreachable!()
+            };
+            let values = StructArray::new(
+                fields.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![Some(1), None, Some(3), Some(4)])),
+                    Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
+                ],
+                Some(NullBuffer::from(vec![true, true, false, true])),
+            );
+            // Rows: [{1}, {null}], null, [], [null element, {4}].
+            let list = GenericListArray::<i32>::new(
+                Arc::clone(element),
+                OffsetBuffer::from_lengths([2, 0, 0, 2]),
+                Arc::new(values),
+                Some(NullBuffer::from(vec![true, false, true, true])),
+            );
+            let batch =
+                RecordBatch::try_new(Arc::clone(&physical_schema), vec![Arc::new(list)])?;
+
+            for expr in [
+                list_element_expr(&logical_schema, false)?,
+                list_element_expr(&logical_schema, true)?,
+                list_transform_expr(&logical_schema, false)?,
+                list_transform_expr(&logical_schema, true)?,
+            ] {
+                let (result, expected) = evaluate_narrowed_and_whole(
+                    &logical_schema,
+                    &physical_schema,
+                    expr,
+                    &batch,
+                )?;
+                assert_eq!(result?.to_data(), expected?.to_data());
+            }
+        }
+        Ok(())
+    }
+
+    /// In `array_transform(l, x -> x['x'])` over a converted List, the
+    /// conversion moves into the lambda and narrows to the field the body
+    /// reads: no Struct of the element is converted.
+    #[test]
+    fn test_narrow_list_cast_into_lambda_body() -> Result<()> {
+        let physical_schema = list_of_struct_schema(DataType::Int32, "item");
+        let logical_schema = list_of_struct_schema(DataType::Int64, "item");
+        let adapter = DefaultPhysicalExprAdapterFactory
+            .create(Arc::clone(&logical_schema), physical_schema)?;
+        let rewritten = adapter.rewrite(list_transform_expr(&logical_schema, true)?)?;
+        let mut casts = Vec::new();
+        rewritten.apply(|node| {
+            if let Some(cast) = node.downcast_ref::<CastExpr>() {
+                casts.push(cast.cast_type().clone());
+            }
+            Ok(datafusion_common::tree_node::TreeNodeRecursion::Continue)
+        })?;
+        assert_eq!(casts, vec![DataType::Int64], "{rewritten}");
+        Ok(())
+    }
+
+    /// An explicit List cast is evaluated whole, so its errors on elements
+    /// the expression does not select still surface.
+    #[test]
+    fn test_narrow_list_cast_keeps_explicit_casts() -> Result<()> {
+        let physical_schema = list_of_struct_schema(DataType::Int32, "item");
+        let logical_schema = list_of_struct_schema(DataType::Int64, "item");
+        let user_cast = Arc::new(CastExpr::new(
+            Arc::new(Column::new("l", 0)),
+            logical_schema.field(0).data_type().clone(),
+            None,
+        )) as Arc<dyn PhysicalExpr>;
+        let expr = list_element_expr(&logical_schema, true)?
+            .transform(|node| {
+                Ok(if node.downcast_ref::<Column>().is_some() {
+                    Transformed::yes(Arc::clone(&user_cast))
+                } else {
+                    Transformed::no(node)
+                })
+            })
+            .data()?;
+
+        let adapter =
+            DefaultPhysicalExprAdapterFactory.create(logical_schema, physical_schema)?;
+        let rewritten = adapter.rewrite(expr)?;
+        assert!(has_list_cast(&rewritten), "{rewritten}");
+        Ok(())
+    }
+
+    /// Decimal conversions that can fail while preparing, even for all-null
+    /// input, have the whole-List conversion's outcome when moved onto the
+    /// selected element: both fail, or both succeed with the same values
+    /// (null elements skip their field conversions either way).
+    #[test]
+    fn test_narrow_list_cast_all_null_decimal_elements() -> Result<()> {
+        use arrow::array::new_null_array;
+        use arrow::buffer::{NullBuffer, OffsetBuffer};
+
+        let mut succeeded = 0;
+        for (physical_type, logical_type) in [
+            (DataType::Decimal128(38, -38), DataType::Decimal128(38, 38)),
+            (DataType::Utf8, DataType::Decimal128(10, -1)),
+            (DataType::Decimal128(38, -39), DataType::Int64),
+        ] {
+            let physical_schema = list_of_struct_schema(physical_type.clone(), "item");
+            let logical_schema = list_of_struct_schema(logical_type, "item");
+            let DataType::List(element) = physical_schema.field(0).data_type() else {
+                unreachable!()
+            };
+            let DataType::Struct(fields) = element.data_type() else {
+                unreachable!()
+            };
+            for element_nulls in [None, Some(NullBuffer::new_null(2))] {
+                let values = StructArray::new(
+                    fields.clone(),
+                    vec![
+                        new_null_array(&physical_type, 2),
+                        new_null_array(&DataType::Utf8, 2),
+                    ],
+                    element_nulls,
+                );
+                let list = GenericListArray::<i32>::new(
+                    Arc::clone(element),
+                    OffsetBuffer::from_lengths([1, 1]),
+                    Arc::new(values),
+                    None,
+                );
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&physical_schema),
+                    vec![Arc::new(list)],
+                )?;
+                for field in [false, true] {
+                    let (result, expected) = evaluate_narrowed_and_whole(
+                        &logical_schema,
+                        &physical_schema,
+                        list_element_expr(&logical_schema, field)?,
+                        &batch,
+                    )?;
+                    match (result, expected) {
+                        (Ok(result), Ok(expected)) => {
+                            assert_eq!(result.to_data(), expected.to_data());
+                            succeeded += 1;
+                        }
+                        (Err(_), Err(_)) => {}
+                        (result, expected) => {
+                            panic!("narrowed {result:?}, whole List {expected:?}")
+                        }
+                    }
+                }
+            }
+        }
+        // All-null elements skip the failing conversions.
+        assert!(succeeded > 0);
+        Ok(())
     }
 }

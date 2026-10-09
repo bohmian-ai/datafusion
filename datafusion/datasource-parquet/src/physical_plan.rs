@@ -33,7 +33,6 @@ use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_physical_expr::ScalarFunctionExpr;
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
-use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_pruning::PruningPredicate;
@@ -44,7 +43,7 @@ use parquet::file::metadata::ParquetMetaData;
 use crate::ParquetFileMetrics;
 use crate::opener::{build_page_pruning_predicate, build_pruning_predicates};
 use crate::page_filter::PagePruningAccessPlanFilter;
-use crate::projection_read_plan::build_projection_read_plan;
+use crate::projection_read_plan::{build_projection_read_plan, rebase_onto_read};
 use crate::row_filter::build_row_filter;
 
 /// Everything [`PerFileParquetReadPlanner::plan`] needs for one file, known
@@ -156,7 +155,7 @@ impl PerFileParquetReadPlanner {
             metadata.file_metadata().schema_descr(),
         );
         let projection = projection.try_map_exprs(|expr| {
-            reassign_expr_columns(expr, &read_plan.projected_schema)
+            rebase_onto_read(expr, &read_plan.projected_schema, &physical_file_schema)
         })?;
         let row_filter = filter
             .as_ref()
@@ -262,10 +261,12 @@ mod tests {
     use parquet::arrow::arrow_reader::ArrowReaderMetadata;
     use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
-    /// `required_path(s)`: `s IS NULL`, declaring one nested path of `s`.
+    /// `required_path(s)`: `s IS NULL`, or `s` itself when `returns_input`,
+    /// declaring one nested path of `s`.
     #[derive(Debug, PartialEq, Eq, Hash)]
     struct RequiredPath {
         path: Vec<String>,
+        returns_input: bool,
         signature: Signature,
     }
 
@@ -278,8 +279,12 @@ mod tests {
             &self.signature
         }
 
-        fn return_type(&self, _: &[DataType]) -> Result<DataType> {
-            Ok(DataType::Boolean)
+        fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+            Ok(if self.returns_input {
+                arg_types[0].clone()
+            } else {
+                DataType::Boolean
+            })
         }
 
         fn required_input_fields(
@@ -294,6 +299,9 @@ mod tests {
         }
 
         fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+            if self.returns_input {
+                return Ok(args.args[0].clone());
+            }
             Ok(ColumnarValue::Array(Arc::new(arrow::compute::is_null(
                 args.args[0].to_array(args.number_rows)?.as_ref(),
             )?)))
@@ -474,23 +482,50 @@ mod tests {
         plan(vec![Arc::new(Column::new("absent", 7))], None)
     }
 
+    /// `required_path(s)` declaring `path`, returning `s` when
+    /// `returns_input`.
+    fn required(path: &[&str], returns_input: bool) -> Arc<dyn PhysicalExpr> {
+        let schema = schema();
+        Arc::new(
+            ScalarFunctionExpr::try_new(
+                Arc::new(ScalarUDF::new_from_impl(RequiredPath {
+                    path: path.iter().map(|name| (*name).to_owned()).collect(),
+                    returns_input,
+                    signature: Signature::any(1, Volatility::Immutable),
+                })),
+                vec![Arc::new(Column::new("s", 0))],
+                &schema,
+                Arc::new(datafusion_common::config::ConfigOptions::default()),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// A function returning a nested type over a read narrowed below its
+    /// input is rebuilt for what it now returns, as the decoder's own
+    /// projection is.
+    #[test]
+    fn projection_is_rebuilt_over_narrowed_reads() {
+        let plan = plan(vec![required(&["b"], true)], None).unwrap();
+        let metadata = file();
+        let leaves = metadata.file_metadata().schema_descr();
+        let narrowed =
+            DataType::Struct(vec![Field::new("b", DataType::Utf8, true)].into());
+        assert_eq!(plan.projection_mask, ProjectionMask::leaves(leaves, [1]));
+        assert_eq!(plan.projected_schema.field(0).data_type(), &narrowed);
+        let projection = plan.projection.as_ref();
+        assert_eq!(
+            projection[0]
+                .expr
+                .data_type(&plan.projected_schema)
+                .unwrap(),
+            narrowed
+        );
+    }
+
     #[test]
     fn invalid_requirements_fall_back_without_pruning() {
-        let required = |path: &[&str]| -> Arc<dyn PhysicalExpr> {
-            let schema = schema();
-            Arc::new(
-                ScalarFunctionExpr::try_new(
-                    Arc::new(ScalarUDF::new_from_impl(RequiredPath {
-                        path: path.iter().map(|name| (*name).to_owned()).collect(),
-                        signature: Signature::any(1, Volatility::Immutable),
-                    })),
-                    vec![Arc::new(Column::new("s", 0))],
-                    &schema,
-                    Arc::new(datafusion_common::config::ConfigOptions::default()),
-                )
-                .unwrap(),
-            )
-        };
+        let required = |path: &[&str]| required(path, false);
         let metadata = file();
         let leaves = metadata.file_metadata().schema_descr();
         let filter = || Some(greater(field("a"), 14));

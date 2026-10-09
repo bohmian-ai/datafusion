@@ -33,13 +33,16 @@ use std::fmt::{self, Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use crate::PhysicalExpr;
-use crate::expressions::{LambdaExpr, Literal};
+use crate::expressions::{LambdaExpr, LambdaVariable, Literal};
+use crate::{PhysicalExpr, ScalarFunctionExpr};
 
 use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::{DataType, FieldRef, Schema};
 use datafusion_common::config::{ConfigEntry, ConfigOptions};
 use datafusion_common::datatype::FieldExt;
+use datafusion_common::tree_node::{
+    Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter,
+};
 use datafusion_common::utils::remove_list_null_values;
 use datafusion_common::{
     Result, ScalarValue, exec_err, internal_datafusion_err, internal_err,
@@ -197,6 +200,88 @@ impl HigherOrderFunctionExpr {
 
     pub fn config_options(&self) -> &ConfigOptions {
         &self.config_options
+    }
+
+    /// Rebuild this function over `list`, a new expression for the List
+    /// argument of its [`ListElementLambda`](datafusion_expr::ListElementLambda),
+    /// rebinding that lambda's element parameter to the new element field.
+    ///
+    /// A [`LambdaVariable`] keeps the field it was planned with, and its
+    /// evaluation rejects a batch whose field differs. A reader that decodes
+    /// only some fields of the List's elements, or a schema adapter that
+    /// moves a conversion of the List into the lambda, changes the element
+    /// type the parameter is bound to, so the lambda must be rebound:
+    ///
+    /// - every reference to the parameter in the lambda body becomes
+    ///   `bind(variable)`, where `variable` reads the parameter at the new
+    ///   element field; references under a nested lambda that declares a
+    ///   parameter of the same name are a different variable and are kept;
+    /// - scalar functions with a nested return type are rebuilt so their
+    ///   return fields follow their arguments, and nested higher-order
+    ///   functions are rebuilt, rebinding their own list element lambdas.
+    ///
+    /// The body is rewritten in one bottom-up pass in which every node is
+    /// visited once and a replacement is never visited again, so `bind` may
+    /// return an expression that contains the variable it was given.
+    /// `schema` is the schema `list` and the columns the lambda captures are
+    /// evaluated against.
+    ///
+    /// Returns `None` when the function declares no list element lambda.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `list` is not a List or LargeList, when `bind`
+    /// fails, or when a rebuilt function rejects its new argument types.
+    pub fn rebind_list_element(
+        &self,
+        list: Arc<dyn PhysicalExpr>,
+        schema: &Schema,
+        bind: &dyn Fn(Arc<dyn PhysicalExpr>) -> Result<Arc<dyn PhysicalExpr>>,
+    ) -> Result<Option<Self>> {
+        let Some(access) = self.fun.list_element_lambda() else {
+            return Ok(None);
+        };
+        let (DataType::List(element) | DataType::LargeList(element)) =
+            list.data_type(schema)?
+        else {
+            return plan_err!(
+                "{} expects a List argument at position {}, got {list}",
+                self.name,
+                access.list_arg
+            );
+        };
+        let ArgSlot::Lambda(lambda) = &self.slots[access.lambda_arg] else {
+            return internal_err!(
+                "{} declares a lambda at position {} that is not one",
+                self.name,
+                access.lambda_arg
+            );
+        };
+        let lambda = match lambda.params().get(access.parameter) {
+            Some(name) => {
+                let mut rebinder = ParameterRebinder {
+                    name,
+                    field: element.renamed(name),
+                    schema,
+                    bind,
+                };
+                let body = Arc::clone(lambda.body()).rewrite(&mut rebinder)?.data;
+                LambdaExpr::try_new(lambda.params().to_vec(), body)?
+            }
+            // A lambda that declares no element parameter cannot read it.
+            None => lambda.as_ref().clone(),
+        };
+
+        let mut args = self.args.clone();
+        args[access.list_arg] = list;
+        args[access.lambda_arg] = Arc::new(lambda);
+        Self::try_new_with_schema(
+            Arc::clone(&self.fun),
+            args,
+            schema,
+            Arc::clone(&self.config_options),
+        )
+        .map(Some)
     }
 
     /// Resolve every lambda's parameter list. Returns an empty `Vec` when
@@ -487,6 +572,89 @@ impl PhysicalExpr for HigherOrderFunctionExpr {
     }
 }
 
+/// Rewrites a lambda body for [`HigherOrderFunctionExpr::rebind_list_element`].
+///
+/// `f_down` never changes the tree; it only skips the subtree of a nested
+/// lambda that shadows the parameter. `f_up` sees each node once, after its
+/// children, and its replacements are not visited again, so the rewrite
+/// terminates whatever `bind` returns.
+struct ParameterRebinder<'a> {
+    /// The parameter's name, which every [`LambdaVariable`] reading it carries.
+    name: &'a str,
+    /// The parameter's new field, already renamed to `name`.
+    field: FieldRef,
+    /// The schema captured columns are evaluated against.
+    schema: &'a Schema,
+    /// Builds the expression that replaces each reference to the parameter.
+    bind: &'a dyn Fn(Arc<dyn PhysicalExpr>) -> Result<Arc<dyn PhysicalExpr>>,
+}
+
+impl TreeNodeRewriter for ParameterRebinder<'_> {
+    type Node = Arc<dyn PhysicalExpr>;
+
+    /// Skip a nested lambda that declares a parameter named like this one:
+    /// references below it read that parameter instead.
+    fn f_down(&mut self, node: Self::Node) -> Result<Transformed<Self::Node>> {
+        let shadows = node
+            .downcast_ref::<LambdaExpr>()
+            .is_some_and(|lambda| lambda.params().iter().any(|p| p == self.name));
+        Ok(if shadows {
+            Transformed::new(node, false, TreeNodeRecursion::Jump)
+        } else {
+            Transformed::no(node)
+        })
+    }
+
+    /// Rebind a reference to the parameter, or rebuild a function so its
+    /// return field follows its (possibly rebound) arguments.
+    fn f_up(&mut self, node: Self::Node) -> Result<Transformed<Self::Node>> {
+        if let Some(variable) = node.downcast_ref::<LambdaVariable>()
+            && variable.name() == self.name
+        {
+            let rebound = LambdaVariable::new(variable.index(), Arc::clone(&self.field));
+            return (self.bind)(Arc::new(rebound)).map(Transformed::yes);
+        }
+        if let Some(function) = node.downcast_ref::<ScalarFunctionExpr>()
+            && function.return_type().is_nested()
+        {
+            let rebuilt = ScalarFunctionExpr::try_new(
+                Arc::new(function.fun().clone()),
+                function.args().to_vec(),
+                self.schema,
+                Arc::new(function.config_options().clone()),
+            )?;
+            if rebuilt.return_field(self.schema)? == function.return_field(self.schema)? {
+                return Ok(Transformed::no(node));
+            }
+            return Ok(Transformed::yes(Arc::new(rebuilt)));
+        }
+        if let Some(function) = node.downcast_ref::<HigherOrderFunctionExpr>() {
+            let rebuilt = match function.fun.list_element_lambda() {
+                Some(access) => function.rebind_list_element(
+                    Arc::clone(&function.args[access.list_arg]),
+                    self.schema,
+                    &Ok,
+                )?,
+                None => None,
+            };
+            let rebuilt = match rebuilt {
+                Some(rebuilt) => rebuilt,
+                None => HigherOrderFunctionExpr::try_new_with_schema(
+                    Arc::clone(&function.fun),
+                    function.args.clone(),
+                    self.schema,
+                    Arc::clone(&function.config_options),
+                )?,
+            };
+            if rebuilt == *function {
+                return Ok(Transformed::no(node));
+            }
+            return Ok(Transformed::yes(Arc::new(rebuilt)));
+        }
+        Ok(Transformed::no(node))
+    }
+}
+
 fn wrapped_lambda(expr: &Arc<dyn PhysicalExpr>) -> Option<&LambdaExpr> {
     let mut current = expr;
 
@@ -511,19 +679,24 @@ mod tests {
     use super::*;
     use crate::HigherOrderFunctionExpr;
     use crate::create_physical_expr;
+    use crate::expressions::CastExpr;
     use crate::expressions::Column;
     use crate::expressions::NoOp;
     use crate::expressions::lambda;
     use crate::expressions::not;
     use arrow::array::RecordBatchOptions;
-    use arrow::array::{ArrayRef, Int32Array};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{
+        ArrayRef, AsArray, Int32Array, ListArray, StringArray, StructArray,
+    };
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::{DataType, Field, Fields, Schema};
     use datafusion_common::Result;
     use datafusion_common::assert_contains;
     use datafusion_expr::execution_props::ExecutionProps;
     use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
     use datafusion_expr::{
-        HigherOrderFunctionArgs, HigherOrderSignature, HigherOrderUDF, HigherOrderUDFImpl,
+        HigherOrderFunctionArgs, HigherOrderSignature, HigherOrderUDF,
+        HigherOrderUDFImpl, ListElementLambda,
     };
     use datafusion_expr_common::columnar_value::ColumnarValue;
     use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
@@ -781,5 +954,403 @@ mod tests {
         // a + v; k's sentinel (-1000) must not leak into the result.
         let expected = Int32Array::from(vec![11, 22, 33]);
         assert_eq!(result.as_ref(), &expected);
+    }
+
+    /// A list function whose lambda maps each element, like
+    /// `array_transform`: it declares a [`ListElementLambda`].
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct MockListTransform {
+        signature: HigherOrderSignature,
+    }
+
+    impl HigherOrderUDFImpl for MockListTransform {
+        fn name(&self) -> &str {
+            "mock_transform"
+        }
+
+        fn signature(&self) -> &HigherOrderSignature {
+            &self.signature
+        }
+
+        fn lambda_parameters(
+            &self,
+            _step: usize,
+            fields: &[ValueOrLambda<FieldRef, Option<FieldRef>>],
+        ) -> Result<LambdaParametersProgress> {
+            let ValueOrLambda::Value(list) = &fields[0] else {
+                return plan_err!("expected a list");
+            };
+            let DataType::List(element) = list.data_type() else {
+                return plan_err!("expected a list");
+            };
+            Ok(LambdaParametersProgress::Complete(vec![vec![Arc::clone(
+                element,
+            )]]))
+        }
+
+        fn list_element_lambda(&self) -> Option<ListElementLambda> {
+            Some(ListElementLambda {
+                list_arg: 0,
+                lambda_arg: 1,
+                parameter: 0,
+            })
+        }
+
+        fn return_field_from_args(
+            &self,
+            args: HigherOrderReturnFieldArgs,
+        ) -> Result<FieldRef> {
+            let ValueOrLambda::Lambda(lambda) = &args.arg_fields[1] else {
+                return plan_err!("expected a lambda");
+            };
+            Ok(Arc::new(Field::new(
+                "",
+                DataType::new_list(lambda.data_type().clone(), true),
+                true,
+            )))
+        }
+
+        fn invoke_with_args(
+            &self,
+            args: HigherOrderFunctionArgs,
+        ) -> Result<ColumnarValue> {
+            let (ValueOrLambda::Value(list), ValueOrLambda::Lambda(lambda)) =
+                (&args.args[0], &args.args[1])
+            else {
+                return plan_err!("expected a list and a lambda");
+            };
+            let list = list.to_array(args.number_rows)?;
+            let list = list.as_list::<i32>();
+            let values = Arc::clone(list.values());
+            let mapped = lambda
+                .evaluate(&[&|| Ok(Arc::clone(&values))], |arrays| Ok(arrays.to_vec()))?
+                .into_array(values.len())?;
+            let DataType::List(field) = args.return_field.data_type() else {
+                return plan_err!("expected a list");
+            };
+            Ok(ColumnarValue::Array(Arc::new(ListArray::new(
+                Arc::clone(field),
+                list.offsets().clone(),
+                mapped,
+                list.nulls().cloned(),
+            ))))
+        }
+    }
+
+    /// Element fields named by `names`, from `f: Int32`, `g: Utf8` and
+    /// `items: List<Struct>` whose item fields, from `a: Int32` and
+    /// `b: Utf8`, are named by `item_names`.
+    fn element_fields(names: &[&str], item_names: &[&str]) -> Fields {
+        names
+            .iter()
+            .map(|name| match *name {
+                "f" | "a" => Field::new(*name, DataType::Int32, true),
+                "g" | "b" => Field::new(*name, DataType::Utf8, true),
+                "items" => Field::new(
+                    "items",
+                    DataType::new_list(
+                        DataType::Struct(element_fields(item_names, &[])),
+                        true,
+                    ),
+                    true,
+                ),
+                other => unreachable!("no test field {other}"),
+            })
+            .collect()
+    }
+
+    /// Three Structs with `fields`, each `items` holding one item.
+    fn struct_array(fields: &Fields) -> ArrayRef {
+        let columns = fields
+            .iter()
+            .map(|field| -> ArrayRef {
+                match field.data_type() {
+                    DataType::Int32 if field.name() == "f" => {
+                        Arc::new(Int32Array::from(vec![1, 2, 3]))
+                    }
+                    DataType::Int32 => Arc::new(Int32Array::from(vec![10, 20, 30])),
+                    DataType::Utf8 => Arc::new(StringArray::from(vec!["p", "q", "r"])),
+                    DataType::List(item) => {
+                        let DataType::Struct(item_fields) = item.data_type() else {
+                            unreachable!("items hold Structs")
+                        };
+                        Arc::new(ListArray::new(
+                            Arc::clone(item),
+                            OffsetBuffer::from_lengths([1, 1, 1]),
+                            struct_array(item_fields),
+                            None,
+                        ))
+                    }
+                    other => unreachable!("no test type {other}"),
+                }
+            })
+            .collect();
+        Arc::new(StructArray::new(fields.clone(), columns, None))
+    }
+
+    /// One row whose List `l` holds the three Structs of [`struct_array`].
+    fn list_batch(fields: &Fields) -> RecordBatch {
+        let element = Arc::new(Field::new_list_field(
+            DataType::Struct(fields.clone()),
+            true,
+        ));
+        let l = ListArray::new(
+            Arc::clone(&element),
+            OffsetBuffer::from_lengths([3]),
+            struct_array(fields),
+            None,
+        );
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "l",
+                DataType::List(element),
+                true,
+            )])),
+            vec![Arc::new(l)],
+        )
+        .unwrap()
+    }
+
+    /// `get_field(source, name)` planned over `schema`.
+    fn field_of(
+        source: Arc<dyn PhysicalExpr>,
+        name: &str,
+        schema: &Schema,
+    ) -> Arc<dyn PhysicalExpr> {
+        Arc::new(
+            ScalarFunctionExpr::try_new(
+                datafusion_functions::core::get_field(),
+                vec![source, Arc::new(Literal::new(ScalarValue::from(name)))],
+                schema,
+                Arc::new(ConfigOptions::new()),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// `fun(list, (param) -> body(param))` planned over `schema`, with the
+    /// parameter at `index` in the lambda's planning schema.
+    fn with_lambda(
+        fun: Arc<HigherOrderUDF>,
+        list: Arc<dyn PhysicalExpr>,
+        params: &[&str],
+        index: usize,
+        param_field: FieldRef,
+        body: impl FnOnce(Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr>,
+        schema: &Schema,
+    ) -> HigherOrderFunctionExpr {
+        let variable =
+            Arc::new(LambdaVariable::new(index, param_field.renamed(params[0])));
+        let lambda = LambdaExpr::try_new(
+            params.iter().map(|p| p.to_string()).collect(),
+            body(variable),
+        )
+        .unwrap();
+        let args = if fun.list_element_lambda().is_some() {
+            vec![list, Arc::new(lambda) as Arc<dyn PhysicalExpr>]
+        } else {
+            vec![Arc::new(lambda) as Arc<dyn PhysicalExpr>]
+        };
+        HigherOrderFunctionExpr::try_new_with_schema(
+            fun,
+            args,
+            schema,
+            Arc::new(ConfigOptions::new()),
+        )
+        .unwrap()
+    }
+
+    /// `mock_transform(list, (param) -> body(param))` over `schema`.
+    fn transform(
+        list: Arc<dyn PhysicalExpr>,
+        param: &str,
+        index: usize,
+        body: impl FnOnce(Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr>,
+        schema: &Schema,
+    ) -> Arc<dyn PhysicalExpr> {
+        let DataType::List(element) = list.data_type(schema).unwrap() else {
+            unreachable!("transform takes a List")
+        };
+        let fun = Arc::new(HigherOrderUDF::new_from_impl(MockListTransform {
+            signature: HigherOrderSignature::variadic_any(Volatility::Immutable),
+        }));
+        Arc::new(with_lambda(
+            fun,
+            list,
+            &[param],
+            index,
+            element,
+            body,
+            schema,
+        ))
+    }
+
+    /// Evaluate `expr` over `batch` to an array.
+    fn evaluate(expr: &dyn PhysicalExpr, batch: &RecordBatch) -> Result<ArrayRef> {
+        expr.evaluate(batch)?.into_array(batch.num_rows())
+    }
+
+    /// Rebind `expr`, a `mock_transform`, over `l` in `batch`.
+    fn rebind(
+        expr: &Arc<dyn PhysicalExpr>,
+        batch: &RecordBatch,
+        bind: &dyn Fn(Arc<dyn PhysicalExpr>) -> Result<Arc<dyn PhysicalExpr>>,
+    ) -> Result<HigherOrderFunctionExpr> {
+        let function = expr.downcast_ref::<HigherOrderFunctionExpr>().unwrap();
+        Ok(function
+            .rebind_list_element(Arc::new(Column::new("l", 0)), batch.schema_ref(), bind)?
+            .expect("mock_transform declares a list element lambda"))
+    }
+
+    /// Over a List narrowed to some element fields, the planned function is
+    /// rejected; rebinding rebinds its parameter and a nested list element
+    /// lambda's, and evaluates to what the planned function did over the
+    /// whole List.
+    #[test]
+    fn rebind_list_element_follows_a_narrowed_list() -> Result<()> {
+        let full = list_batch(&element_fields(&["f", "g", "items"], &["a", "b"]));
+        let narrowed = list_batch(&element_fields(&["f", "items"], &["a"]));
+        let schema = full.schema();
+        // mock_transform(l, x -> mock_transform(x['items'], y -> y['a']))
+        let planned = transform(
+            Arc::new(Column::new("l", 0)),
+            "x",
+            1,
+            |x| {
+                transform(
+                    field_of(x, "items", &schema),
+                    "y",
+                    2,
+                    |y| field_of(y, "a", &schema),
+                    &schema,
+                )
+            },
+            &schema,
+        );
+
+        assert_contains!(
+            evaluate(planned.as_ref(), &narrowed)
+                .unwrap_err()
+                .to_string(),
+            "doesn't match batch field"
+        );
+        let rebound = rebind(&planned, &narrowed, &Ok)?;
+        assert_eq!(
+            evaluate(&rebound, &narrowed)?.as_ref(),
+            evaluate(planned.as_ref(), &full)?.as_ref()
+        );
+        Ok(())
+    }
+
+    /// `bind` may return an expression containing the variable it was given:
+    /// each reference is replaced once.
+    #[test]
+    fn rebind_list_element_binds_each_reference_once() -> Result<()> {
+        let full = list_batch(&element_fields(&["f", "g", "items"], &["a", "b"]));
+        let narrowed = list_batch(&element_fields(&["f"], &[]));
+        let schema = full.schema();
+        // mock_transform(l, x -> x['f'])
+        let planned = transform(
+            Arc::new(Column::new("l", 0)),
+            "x",
+            1,
+            |x| field_of(x, "f", &schema),
+            &schema,
+        );
+        let element_type =
+            DataType::Struct(element_fields(&["f", "g", "items"], &["a", "b"]));
+
+        let rebound = rebind(&planned, &narrowed, &|x| {
+            Ok(Arc::new(CastExpr::new(x, element_type.clone(), None)))
+        })?;
+
+        let ArgSlot::Lambda(lambda) = &rebound.slots[1] else {
+            unreachable!("argument 1 is the lambda")
+        };
+        let mut casts = 0;
+        let mut variables = 0;
+        lambda.body().apply(|node| {
+            casts += usize::from(node.is::<CastExpr>());
+            variables += usize::from(node.is::<LambdaVariable>());
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        assert_eq!((casts, variables), (1, 1));
+        assert_eq!(
+            evaluate(&rebound, &narrowed)?.as_ref(),
+            evaluate(planned.as_ref(), &full)?.as_ref()
+        );
+        Ok(())
+    }
+
+    /// A nested lambda declaring the parameter's name reads its own
+    /// parameter, which keeps its field.
+    #[test]
+    fn rebind_list_element_keeps_shadowing_parameters() -> Result<()> {
+        let full = list_batch(&element_fields(&["f", "g"], &[]));
+        let narrowed = list_batch(&element_fields(&["f"], &[]));
+        let schema = full.schema();
+        let inner = Arc::new(HigherOrderUDF::new_from_impl(MockHigherOrderUDF {
+            signature: HigherOrderSignature::variadic_any(Volatility::Immutable),
+        }));
+        let int32 = Arc::new(Field::new("", DataType::Int32, true));
+        // mock_transform(l, x -> mock_function((x, v) -> x)): the inner `x`
+        // is mock_function's Int32 parameter.
+        let planned = transform(
+            Arc::new(Column::new("l", 0)),
+            "x",
+            1,
+            |_| {
+                Arc::new(with_lambda(
+                    inner,
+                    Arc::new(Column::new("l", 0)),
+                    &["x", "v"],
+                    2,
+                    int32,
+                    |x| x,
+                    &schema,
+                ))
+            },
+            &schema,
+        );
+
+        let rebound: Arc<dyn PhysicalExpr> = Arc::new(rebind(&planned, &narrowed, &Ok)?);
+
+        let mut fields = Vec::new();
+        rebound.apply(|node| {
+            if let Some(variable) = node.downcast_ref::<LambdaVariable>() {
+                fields.push(variable.field().data_type().clone());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        assert_eq!(fields, vec![DataType::Int32]);
+        assert_eq!(
+            evaluate(rebound.as_ref(), &narrowed)?.as_ref(),
+            evaluate(planned.as_ref(), &full)?.as_ref()
+        );
+        Ok(())
+    }
+
+    /// A function without a list element lambda is not rebound.
+    #[test]
+    fn rebind_list_element_needs_a_list_element_lambda() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+        let fun = Arc::new(HigherOrderUDF::new_from_impl(MockHigherOrderUDF {
+            signature: HigherOrderSignature::variadic_any(Volatility::Immutable),
+        }));
+        let function = with_lambda(
+            fun,
+            Arc::new(Column::new("a", 0)),
+            &["x"],
+            1,
+            Arc::new(Field::new("", DataType::Int32, true)),
+            |x| x,
+            &schema,
+        );
+        assert!(
+            function
+                .rebind_list_element(Arc::new(Column::new("a", 0)), &schema, &Ok)?
+                .is_none()
+        );
+        Ok(())
     }
 }

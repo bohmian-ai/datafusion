@@ -27,9 +27,10 @@
 //! so that [`crate::row_filter`] depends on this module and not vice versa.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Schema, SchemaRef};
+use arrow::datatypes::{DataType, FieldRef, Fields, Schema, SchemaRef};
 use datafusion_functions::core::input_file_name::InputFileNameFunc;
 use parquet::arrow::ProjectionMask;
 use parquet::schema::types::SchemaDescriptor;
@@ -39,14 +40,19 @@ use datafusion_common::nested_struct::{is_variant, requires_nested_struct_cast};
 use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion, TreeNodeVisitor,
 };
+use datafusion_expr::ListElementLambda;
 use datafusion_functions::core::file_row_index::FileRowIndexFunc;
-use datafusion_physical_expr::expressions::{CastExpr, Column};
+use datafusion_physical_expr::expressions::{
+    CastExpr, Column, LambdaExpr, LambdaVariable,
+};
 use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
-use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr};
+use datafusion_physical_expr::{
+    HigherOrderFunctionExpr, PhysicalExpr, ScalarFunctionExpr,
+};
 
 use crate::nested_schema_pruning::{
-    CastColumnAccess, clip_for_cast, contains_struct, count_leaves, field_with_type,
-    type_for_leaf_subset,
+    CastColumnAccess, clip_for_cast, contains_struct, contains_struct_list, count_leaves,
+    field_with_type, type_for_leaf_subset,
 };
 
 /// The result of resolving which Parquet leaf columns and Arrow schema fields
@@ -76,6 +82,50 @@ pub(crate) struct StructFieldAccess {
     /// Field names forming the path into the struct.
     /// e.g., `["value"]` for `s['value']`, `["outer", "inner"]` for `s['outer']['inner']`.
     pub(crate) field_path: Vec<String>,
+}
+
+/// One step of a nested access path: a Struct field by name, or the
+/// elements of a List.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AccessStep {
+    /// The Struct field of this name.
+    Field(String),
+    /// Each element of a List or LargeList.
+    Element,
+}
+
+/// A contiguous range of leaves, relative to a root column's first Parquet
+/// leaf, read for an access through List elements.
+///
+/// Paths through a List select leaves by position in the root's Arrow type,
+/// since Parquet names the List wrapper groups differently per writer. They
+/// prune the projection only: statistics of a List leaf describe every
+/// element, not the one an expression reads.
+#[derive(Debug, Clone)]
+pub(crate) struct LeafRangeAccess {
+    /// Arrow root column index in the file schema.
+    pub(crate) root_index: usize,
+    /// Leaf offsets below the root.
+    pub(crate) leaves: Range<usize>,
+}
+
+/// A lambda parameter in scope while [`PushdownChecker`] walks a lambda body.
+///
+/// The element parameter of a list element lambda (see
+/// `HigherOrderUDFImpl::list_element_lambda`) over a file List is bound to
+/// that List's elements, so accesses through it select leaves as accesses
+/// through `list[i]` do. Every other parameter, including one that shadows an
+/// outer binding, is unbound.
+#[derive(Debug)]
+struct LambdaBinding {
+    /// The parameter's name, which its `LambdaVariable`s carry.
+    name: String,
+    /// The root column index in the file schema and the path to the List
+    /// elements the parameter iterates; `None` when unbound.
+    element: Option<(usize, Vec<AccessStep>)>,
+    /// Whether the body read the parameter. An unread element still needs
+    /// the List's offsets and validity, so its leaves are read whole.
+    used: bool,
 }
 
 /// Trie of nested struct accesses, keyed at the top by the root column index in
@@ -193,6 +243,15 @@ pub(crate) struct PushdownChecker<'schema> {
     allow_struct_casts: bool,
     /// Whether nested list columns are supported by the predicate semantics.
     allow_list_columns: bool,
+    /// Whether to collect leaves read through List element access
+    /// (projection analysis of files with Lists of Structs only).
+    collect_list_accesses: bool,
+    /// Leaves read through List element access, collected with
+    /// [`Self::with_list_collection`].
+    leaf_range_accesses: Vec<LeafRangeAccess>,
+    /// Lambda parameters in scope, innermost last, maintained with
+    /// [`Self::with_list_collection`].
+    lambda_bindings: Vec<LambdaBinding>,
     /// The Arrow schema of the parquet file.
     file_schema: &'schema Schema,
 }
@@ -213,6 +272,9 @@ impl<'schema> PushdownChecker<'schema> {
             collect_cast_accesses: false,
             allow_struct_casts,
             allow_list_columns,
+            collect_list_accesses: false,
+            leaf_range_accesses: Vec::new(),
+            lambda_bindings: Vec::new(),
             file_schema,
         }
     }
@@ -220,6 +282,13 @@ impl<'schema> PushdownChecker<'schema> {
     /// Enable collection of whole-column casts to narrower nested types.
     pub(crate) fn with_cast_collection(mut self) -> Self {
         self.collect_cast_accesses = true;
+        self
+    }
+
+    /// Enable collection of the leaves read below Lists through element
+    /// access. Only paid for by projections of Lists of Structs.
+    pub(crate) fn with_list_collection(mut self) -> Self {
+        self.collect_list_accesses = true;
         self
     }
 
@@ -362,6 +431,180 @@ impl<'schema> PushdownChecker<'schema> {
         }
     }
 
+    /// Resolve an access chain to its root column and full path. A source
+    /// that is a bound lambda parameter resolves through the List elements it
+    /// is bound to, and is marked used. Returns `None` for a source that is
+    /// neither a file column nor a bound parameter.
+    fn resolve_access(
+        &mut self,
+        source: &Arc<dyn PhysicalExpr>,
+        steps: Vec<AccessStep>,
+    ) -> Option<(usize, Vec<AccessStep>)> {
+        if let Some(column) = source.downcast_ref::<Column>() {
+            return Some((self.file_schema.index_of(column.name()).ok()?, steps));
+        }
+        let variable = source.downcast_ref::<LambdaVariable>()?;
+        let binding = self
+            .lambda_bindings
+            .iter_mut()
+            .rev()
+            .find(|binding| binding.name == variable.name())?;
+        let (root, prefix) = binding.element.as_ref()?;
+        binding.used = true;
+        Some((*root, prefix.iter().cloned().chain(steps).collect()))
+    }
+
+    /// Walk a list element lambda (such as `array_transform(l, x -> ...)`)
+    /// with its element parameter bound to the elements of the List argument,
+    /// so the body's accesses through the parameter select leaves under them.
+    ///
+    /// The List argument itself is not read whole: the body's accesses, or
+    /// every leaf of the element when the body never reads the parameter,
+    /// carry its offsets and validity. A List argument that is no access of
+    /// a file List is visited as any other argument, with the parameter
+    /// unbound. The other parameters are unbound and shadow outer ones.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when visiting an argument or the body fails.
+    fn check_list_element_lambda(
+        &mut self,
+        function: &HigherOrderFunctionExpr,
+        access: ListElementLambda,
+        list: &Arc<dyn PhysicalExpr>,
+        lambda: &LambdaExpr,
+    ) -> Result<TreeNodeRecursion> {
+        let (source, steps) = nested_access_chain(list);
+        let element = self
+            .resolve_access(source, steps)
+            .and_then(|(root, mut path)| {
+                path.push(AccessStep::Element);
+                leaf_range(self.file_schema.field(root).data_type(), &path)
+                    .map(|_| (root, path))
+            });
+        for (index, argument) in function.args().iter().enumerate() {
+            if index == access.lambda_arg
+                || (index == access.list_arg && element.is_some())
+            {
+                continue;
+            }
+            argument.visit(self)?;
+        }
+
+        let scope = self.lambda_bindings.len();
+        let mut element = element;
+        self.lambda_bindings
+            .extend(lambda.params().iter().enumerate().map(|(index, name)| {
+                LambdaBinding {
+                    name: name.clone(),
+                    element: if index == access.parameter {
+                        element.take()
+                    } else {
+                        None
+                    },
+                    used: false,
+                }
+            }));
+        lambda.body().visit(self)?;
+        let unread = self
+            .lambda_bindings
+            .drain(scope..)
+            .find_map(|binding| binding.element.filter(|_| !binding.used));
+        if let Some((root, path)) = unread {
+            self.record_leaf_range(root, &path);
+        }
+        Ok(TreeNodeRecursion::Jump)
+    }
+
+    /// Record the leaves under `path` of `root`; `false` when the path does
+    /// not resolve through Struct fields and List elements.
+    fn record_leaf_range(&mut self, root: usize, path: &[AccessStep]) -> bool {
+        let Some(leaves) = leaf_range(self.file_schema.field(root).data_type(), path)
+        else {
+            return false;
+        };
+        self.leaf_range_accesses.push(LeafRangeAccess {
+            root_index: root,
+            leaves,
+        });
+        true
+    }
+
+    /// Record the leaves a cast of a List element access consumes, such as
+    /// `CAST(events[1] AS Struct<subset>)`, which the physical expression
+    /// adapter leaves when it moves a whole-column List cast below element
+    /// access.
+    ///
+    /// As for a whole-column cast, the cast is kept and the read is clipped
+    /// to the fields its target names (see `clip_for_cast`). A cast that
+    /// cannot be clipped reads every leaf of the element. `None` when the
+    /// cast's input is not an element access of a file column.
+    fn check_element_cast(&mut self, cast: &CastExpr) -> Option<TreeNodeRecursion> {
+        if is_variant(cast.target_field()) {
+            return None;
+        }
+        let (source, steps) = nested_access_chain(cast.expr());
+        if !steps.contains(&AccessStep::Element) && !source.is::<LambdaVariable>() {
+            return None;
+        }
+        let (root, path) = self.resolve_access(source, steps)?;
+        let root_type = self.file_schema.field(root).data_type();
+        let leaves = leaf_range(root_type, &path)?;
+        match clip_for_cast(access_type(root_type, &path)?, cast.cast_type()) {
+            Some((kept, _)) => {
+                self.leaf_range_accesses
+                    .extend(kept.into_iter().map(|offset| LeafRangeAccess {
+                        root_index: root,
+                        leaves: leaves.start + offset..leaves.start + offset + 1,
+                    }))
+            }
+            None => self.leaf_range_accesses.push(LeafRangeAccess {
+                root_index: root,
+                leaves,
+            }),
+        }
+        Some(TreeNodeRecursion::Jump)
+    }
+
+    /// Record a function's declared input fields on an argument read through
+    /// List elements; `false` when the argument is not such an access.
+    fn record_list_requirement(
+        &mut self,
+        argument: &Arc<dyn PhysicalExpr>,
+        field_paths: &[Vec<String>],
+    ) -> bool {
+        let (source, steps) = nested_access_chain(argument);
+        if !steps.contains(&AccessStep::Element) && !source.is::<LambdaVariable>() {
+            return false;
+        }
+        let Some((root, prefix)) = self.resolve_access(source, steps) else {
+            return false;
+        };
+        let root_type = self.file_schema.field(root).data_type();
+        let ranges = field_paths
+            .iter()
+            .map(|path| {
+                let path = prefix
+                    .iter()
+                    .cloned()
+                    .chain(path.iter().cloned().map(AccessStep::Field))
+                    .collect::<Vec<_>>();
+                leaf_range(root_type, &path)
+            })
+            .collect::<Option<Vec<_>>>();
+        match ranges {
+            Some(ranges) if !ranges.is_empty() => {
+                self.leaf_range_accesses
+                    .extend(ranges.into_iter().map(|leaves| LeafRangeAccess {
+                        root_index: root,
+                        leaves,
+                    }));
+                true
+            }
+            _ => self.record_leaf_range(root, &prefix),
+        }
+    }
+
     #[inline]
     pub(crate) fn prevents_pushdown(&self) -> bool {
         self.non_primitive_columns || self.projected_columns || self.has_unpushable_udfs
@@ -380,6 +623,7 @@ impl<'schema> PushdownChecker<'schema> {
             required_columns: self.required_columns,
             struct_field_accesses: self.struct_field_accesses,
             cast_accesses: self.cast_accesses,
+            leaf_range_accesses: self.leaf_range_accesses,
         }
     }
 }
@@ -388,7 +632,63 @@ impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
     type Node = Arc<dyn PhysicalExpr>;
 
     fn f_down(&mut self, node: &Self::Node) -> Result<TreeNodeRecursion> {
-        let (source, field_path) = struct_access_chain(node);
+        if self.collect_list_accesses {
+            if let Some(function) = node.downcast_ref::<HigherOrderFunctionExpr>()
+                && let Some(access) = function.fun().list_element_lambda()
+                && let Some(list) = function.args().get(access.list_arg)
+                && let Some(lambda) = function
+                    .args()
+                    .get(access.lambda_arg)
+                    .and_then(|lambda| lambda.downcast_ref::<LambdaExpr>())
+            {
+                return self.check_list_element_lambda(function, access, list, lambda);
+            }
+            // Any other lambda's parameters shadow outer bindings; `f_up`
+            // takes them out of scope.
+            if let Some(lambda) = node.downcast_ref::<LambdaExpr>() {
+                self.lambda_bindings
+                    .extend(lambda.params().iter().map(|name| LambdaBinding {
+                        name: name.clone(),
+                        element: None,
+                        used: false,
+                    }));
+                return Ok(TreeNodeRecursion::Continue);
+            }
+        }
+        let (source, field_path) = if self.collect_list_accesses {
+            // One walk serves both: a chain without List element steps is a
+            // Struct access chain.
+            let (source, steps) = nested_access_chain(node);
+            let variable = source.is::<LambdaVariable>();
+            if steps.contains(&AccessStep::Element) || variable {
+                if let Some((root, mut path)) = self.resolve_access(source, steps) {
+                    if self.record_leaf_range(root, &path) {
+                        return Ok(TreeNodeRecursion::Jump);
+                    }
+                    // A parameter's path stops resolving at a type other
+                    // than a Struct or List (a Map, say); read below the last
+                    // step that does. The element itself always resolves.
+                    if variable {
+                        while !self.record_leaf_range(root, &path) {
+                            path.pop();
+                        }
+                        return Ok(TreeNodeRecursion::Jump);
+                    }
+                }
+                struct_access_chain(node)
+            } else {
+                let field_path = steps
+                    .into_iter()
+                    .filter_map(|step| match step {
+                        AccessStep::Field(name) => Some(name),
+                        AccessStep::Element => None,
+                    })
+                    .collect();
+                (source, field_path)
+            }
+        } else {
+            struct_access_chain(node)
+        };
         if !field_path.is_empty() {
             let return_type = node.data_type(self.file_schema)?;
             if let Some(recursion) =
@@ -449,6 +749,12 @@ impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
                 if let Some(requirement) =
                     requirements.iter().find(|r| r.arg_index == index)
                 {
+                    if self.collect_list_accesses
+                        && self
+                            .record_list_requirement(argument, &requirement.field_paths)
+                    {
+                        continue;
+                    }
                     // Requirements on a Struct field chain apply below its path.
                     let (source, prefix) = struct_access_chain(argument);
                     if let Some(column) = source.downcast_ref::<Column>()
@@ -493,6 +799,13 @@ impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
             return Ok(TreeNodeRecursion::Jump);
         }
 
+        if self.collect_list_accesses
+            && let Some(cast) = node.downcast_ref::<CastExpr>()
+            && let Some(recursion) = self.check_element_cast(cast)
+        {
+            return Ok(recursion);
+        }
+
         // Handle whole-column casts to a narrower nested type, e.g.
         // `CAST(events AS List<Struct<subset of fields>>)` as inserted by the
         // physical expression adapter when the logical file schema declares a
@@ -533,6 +846,18 @@ impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
 
         Ok(TreeNodeRecursion::Continue)
     }
+
+    /// Take the parameters a [`LambdaExpr`] brought into scope in `f_down`
+    /// out of scope again.
+    fn f_up(&mut self, node: &Self::Node) -> Result<TreeNodeRecursion> {
+        if self.collect_list_accesses
+            && let Some(lambda) = node.downcast_ref::<LambdaExpr>()
+        {
+            let scope = self.lambda_bindings.len() - lambda.params().len();
+            self.lambda_bindings.truncate(scope);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    }
 }
 
 /// Rebase `expr` onto `read_schema`, the schema a read plan decodes.
@@ -541,11 +866,15 @@ impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
 /// `file_schema` holds (for example `s.v` under `variant_get(s['v'], 'k')`,
 /// which declared only some of `s.v`'s leaves), a function returning a
 /// nested type is rebuilt so its return field matches what it produces over
-/// the narrowed input. Reads that narrow nothing are only reassigned.
+/// the narrowed input, and a list element lambda over a narrowed List has its
+/// element parameter rebound to the narrowed element (see
+/// `HigherOrderFunctionExpr::rebind_list_element`). Reads that narrow nothing
+/// are only reassigned.
 ///
 /// # Errors
 ///
-/// Returns an error when a column cannot be reassigned.
+/// Returns an error when a column cannot be reassigned or a list element
+/// lambda cannot be rebound.
 pub(crate) fn rebase_onto_read(
     expr: Arc<dyn PhysicalExpr>,
     read_schema: &Schema,
@@ -561,6 +890,17 @@ pub(crate) fn rebase_onto_read(
         return Ok(expr);
     }
     expr.transform_up(|expr| {
+        if let Some(function) = expr.downcast_ref::<HigherOrderFunctionExpr>()
+            && let Some(access) = function.fun().list_element_lambda()
+            && let Some(list) = function.args().get(access.list_arg)
+        {
+            let Some(rebound) =
+                function.rebind_list_element(Arc::clone(list), read_schema, &Ok)?
+            else {
+                return Ok(Transformed::no(expr));
+            };
+            return Ok(Transformed::yes(Arc::new(rebound) as Arc<dyn PhysicalExpr>));
+        }
         let Some(function) = expr.downcast_ref::<ScalarFunctionExpr>() else {
             return Ok(Transformed::no(expr));
         };
@@ -602,6 +942,76 @@ fn struct_access_chain(
     (source, paths.into_iter().rev().flatten().collect())
 }
 
+/// Follow Struct accessors (see [`struct_access_chain`]) and List element
+/// accessors (see `ScalarUDFImpl::list_element_access`) to their source,
+/// returning it with the combined path. Does not look through casts.
+fn nested_access_chain(
+    expr: &Arc<dyn PhysicalExpr>,
+) -> (&Arc<dyn PhysicalExpr>, Vec<AccessStep>) {
+    let mut source = expr;
+    let mut segments = Vec::new();
+    loop {
+        let (struct_source, fields) = struct_access_chain(source);
+        segments.push(
+            fields
+                .into_iter()
+                .map(AccessStep::Field)
+                .collect::<Vec<_>>(),
+        );
+        source = struct_source;
+        let Some(function) = source.downcast_ref::<ScalarFunctionExpr>() else {
+            break;
+        };
+        let Some(list) = function.list_element_access() else {
+            break;
+        };
+        segments.push(vec![AccessStep::Element]);
+        source = &function.args()[list];
+    }
+    (source, segments.into_iter().rev().flatten().collect())
+}
+
+/// The leaves below `path` in a Parquet-derived Arrow type, as offsets from
+/// its first leaf. `None` unless every step names a unique Struct field or
+/// the elements of a List.
+fn leaf_range(data_type: &DataType, path: &[AccessStep]) -> Option<Range<usize>> {
+    let Some((step, rest)) = path.split_first() else {
+        return Some(0..count_leaves(data_type));
+    };
+    match (step, data_type) {
+        (AccessStep::Field(name), DataType::Struct(fields)) => {
+            let (index, field) = unique_field(fields, name)?;
+            let offset = fields
+                .iter()
+                .take(index)
+                .map(|field| count_leaves(field.data_type()))
+                .sum::<usize>();
+            let range = leaf_range(field.data_type(), rest)?;
+            Some(range.start + offset..range.end + offset)
+        }
+        (AccessStep::Element, DataType::List(element) | DataType::LargeList(element)) => {
+            leaf_range(element.data_type(), rest)
+        }
+        _ => None,
+    }
+}
+
+/// The type below `path` in `data_type`. `None` unless every step names a
+/// unique Struct field or the elements of a List.
+fn access_type<'a>(data_type: &'a DataType, path: &[AccessStep]) -> Option<&'a DataType> {
+    path.iter()
+        .try_fold(data_type, |data_type, step| match (step, data_type) {
+            (AccessStep::Field(name), DataType::Struct(fields)) => {
+                unique_field(fields, name).map(|(_, field)| field.data_type())
+            }
+            (
+                AccessStep::Element,
+                DataType::List(element) | DataType::LargeList(element),
+            ) => Some(element.data_type()),
+            _ => None,
+        })
+}
+
 /// Resolve literal names through structs, rejecting missing or ambiguous fields.
 fn resolve_struct_field_type<'a>(
     data_type: &'a DataType,
@@ -611,10 +1021,19 @@ fn resolve_struct_field_type<'a>(
         let DataType::Struct(fields) = data_type else {
             return None;
         };
-        let mut matches = fields.iter().filter(|field| field.name() == name);
-        let field = matches.next()?;
-        matches.next().is_none().then_some(field.data_type())
+        unique_field(fields, name).map(|(_, field)| field.data_type())
     })
+}
+
+/// The position and field named `name` in `fields`, or `None` when no field
+/// or more than one field has that name.
+fn unique_field<'a>(fields: &'a Fields, name: &str) -> Option<(usize, &'a FieldRef)> {
+    let mut matches = fields
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| field.name() == name);
+    let found = matches.next()?;
+    matches.next().is_none().then_some(found)
 }
 
 /// Result of checking which columns are required for filter pushdown.
@@ -630,6 +1049,8 @@ pub(crate) struct PushdownColumns {
     /// Whole-column casts to a narrower nested type, collected for projections
     /// or retained Struct casts accepted by the runtime filter checker.
     pub(crate) cast_accesses: Vec<CastColumnAccess>,
+    /// Leaves read through List elements (projection analysis only).
+    pub(crate) leaf_range_accesses: Vec<LeafRangeAccess>,
 }
 
 /// Builds a unified [`ParquetReadPlan`] for a set of projection expressions
@@ -694,16 +1115,28 @@ pub(crate) fn build_projection_read_plan(
     let mut all_root_indices = Vec::new();
     let mut all_struct_accesses = Vec::new();
     let mut all_cast_accesses = Vec::new();
+    let mut all_leaf_range_accesses = Vec::new();
+
+    // Lists of Structs are the only Lists whose leaves a read can select.
+    let projects_struct_lists = projected_columns.iter().any(|col| {
+        file_schema
+            .field_with_name(col.name())
+            .is_ok_and(|f| contains_struct_list(f.data_type()))
+    });
 
     for expr in exprs {
         let mut checker =
             PushdownChecker::new(file_schema, true, false).with_cast_collection();
+        if projects_struct_lists {
+            checker = checker.with_list_collection();
+        }
         let _ = expr.visit(&mut checker);
         let columns = checker.into_sorted_columns();
 
         all_root_indices.extend_from_slice(&columns.required_columns);
         all_struct_accesses.extend(columns.struct_field_accesses);
         all_cast_accesses.extend(columns.cast_accesses);
+        all_leaf_range_accesses.extend(columns.leaf_range_accesses);
     }
 
     all_root_indices.sort_unstable();
@@ -714,14 +1147,17 @@ pub(crate) fn build_projection_read_plan(
     // front. `all_root_indices` is already sorted, so a binary search
     // avoids building a second set just for this filter.
     all_cast_accesses.retain(|c| all_root_indices.binary_search(&c.root_index).is_err());
+    all_leaf_range_accesses
+        .retain(|a| all_root_indices.binary_search(&a.root_index).is_err());
 
-    if !all_cast_accesses.is_empty() {
+    if !all_cast_accesses.is_empty() || !all_leaf_range_accesses.is_empty() {
         let (read_plan, _leaf_indices) = build_read_plan_with_cast_clipping(
             file_schema,
             schema_descr,
             &all_root_indices,
             &all_struct_accesses,
             &all_cast_accesses,
+            &all_leaf_range_accesses,
         );
         return read_plan;
     }
@@ -775,6 +1211,7 @@ pub(crate) fn build_read_plan_with_cast_clipping(
     whole_root_indices: &[usize],
     struct_accesses: &[StructFieldAccess],
     cast_accesses: &[CastColumnAccess],
+    leaf_range_accesses: &[LeafRangeAccess],
 ) -> (ParquetReadPlan, Vec<usize>) {
     // Every referenced root's Parquet leaves, grouped in one pass over the
     // schema descriptor rather than one `leaf_indices_for_roots` scan per
@@ -810,6 +1247,15 @@ pub(crate) fn build_read_plan_with_cast_clipping(
             None => {
                 root_reads.insert(root, RootRead::Full);
             }
+        }
+    }
+
+    for access in leaf_range_accesses {
+        if let RootRead::Partial(offsets) = root_reads
+            .entry(access.root_index)
+            .or_insert_with(|| RootRead::Partial(BTreeSet::new()))
+        {
+            offsets.extend(access.leaves.clone());
         }
     }
 
@@ -1222,9 +1668,12 @@ fn prune_struct_type(dt: &DataType, node: &StructAccessNode<'_>) -> DataType {
 mod test {
     use super::*;
     use Column as PhysicalColumn;
-    use arrow::array::{Array, Int32Array, RecordBatch, StringArray, StructArray};
+    use arrow::array::{
+        Array, Int32Array, ListArray, RecordBatch, StringArray, StructArray,
+    };
+    use arrow::buffer::{NullBuffer, OffsetBuffer};
     use arrow::datatypes::{Field, Fields};
-    use datafusion_common::ScalarValue;
+    use datafusion_common::{ScalarValue, ToDFSchema};
     use datafusion_expr::{Expr, col};
     use datafusion_functions::core::get_field;
     use datafusion_physical_expr::planner::logical2physical;
@@ -1701,6 +2150,489 @@ mod test {
             plan.projection_mask,
             ProjectionMask::leaves(&parquet_schema, [0, 1])
         );
+    }
+
+    /// `id: Int32`, `l: List<Struct<f: Int32, g: Utf8>>` and
+    /// `s: Struct<x: Int32, l: List<Struct<a: Int32, b: Utf8>>>`.
+    /// Parquet leaves: id=0, l.f=1, l.g=2, s.x=3, s.l.a=4, s.l.b=5.
+    fn struct_list_schema() -> (SchemaRef, SchemaDescriptor) {
+        let element = |first: &str, second: &str| {
+            DataType::Struct(
+                vec![
+                    Field::new(first, DataType::Int32, true),
+                    Field::new(second, DataType::Utf8, true),
+                ]
+                .into(),
+            )
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("l", DataType::new_list(element("f", "g"), true), true),
+            Field::new(
+                "s",
+                DataType::Struct(
+                    vec![
+                        Field::new("x", DataType::Int32, true),
+                        Field::new(
+                            "l",
+                            DataType::new_list(element("a", "b"), true),
+                            true,
+                        ),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+        ]));
+        let schema_descr = ArrowSchemaConverter::new().convert(&schema).unwrap();
+        (schema, schema_descr)
+    }
+
+    /// `l[2]`, then `[field]` for each of `fields`.
+    fn list_element(source: Expr, fields: &[&str]) -> Expr {
+        fields.iter().fold(
+            datafusion_functions_nested::expr_fn::array_element(
+                source,
+                datafusion_expr::lit(2i64),
+            ),
+            |expr, field| get_field().call(vec![expr, datafusion_expr::lit(*field)]),
+        )
+    }
+
+    /// Leaf ranges follow Struct fields by name and List elements by
+    /// position, and give up on anything else.
+    #[test]
+    fn leaf_range_resolves_struct_fields_and_list_elements() {
+        let (schema, _) = struct_list_schema();
+        let l = schema.field(1).data_type();
+        let s = schema.field(2).data_type();
+        let field = |name: &str| AccessStep::Field(name.to_string());
+        let element = || AccessStep::Element;
+
+        assert_eq!(leaf_range(l, &[]), Some(0..2));
+        assert_eq!(leaf_range(l, &[element()]), Some(0..2));
+        assert_eq!(leaf_range(l, &[element(), field("f")]), Some(0..1));
+        assert_eq!(leaf_range(l, &[element(), field("g")]), Some(1..2));
+        assert_eq!(
+            leaf_range(s, &[field("l"), element(), field("b")]),
+            Some(2..3)
+        );
+        let DataType::List(item) = l else {
+            unreachable!()
+        };
+        let large = DataType::LargeList(Arc::clone(item));
+        assert_eq!(leaf_range(&large, &[element(), field("g")]), Some(1..2));
+
+        assert_eq!(leaf_range(l, &[field("f")]), None);
+        assert_eq!(leaf_range(s, &[element()]), None);
+        assert_eq!(leaf_range(l, &[element(), field("missing")]), None);
+        let duplicate = DataType::new_list(
+            DataType::Struct(
+                vec![
+                    Field::new("f", DataType::Int32, true),
+                    Field::new("f", DataType::Utf8, true),
+                ]
+                .into(),
+            ),
+            true,
+        );
+        assert_eq!(leaf_range(&duplicate, &[element(), field("f")]), None);
+        let map = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("key", DataType::Utf8, false),
+                        Field::new("value", DataType::Int32, true),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        assert_eq!(leaf_range(&map, &[element()]), None);
+    }
+
+    /// Element access through a List, at the root or below a Struct, reads
+    /// only the element fields it selects; the projected type is the List
+    /// narrowed to them.
+    #[test]
+    fn build_projection_read_plan_reads_only_selected_element_fields() {
+        let (schema, schema_descr) = struct_list_schema();
+        let narrowed_list = |name: &str, data_type: DataType| {
+            DataType::new_list(
+                DataType::Struct(vec![Field::new(name, data_type, true)].into()),
+                true,
+            )
+        };
+        for (expr, leaves, root, root_type) in [
+            (
+                list_element(col("l"), &["f"]),
+                vec![1],
+                "l",
+                narrowed_list("f", DataType::Int32),
+            ),
+            (
+                list_element(col("l"), &["g"]),
+                vec![2],
+                "l",
+                narrowed_list("g", DataType::Utf8),
+            ),
+            (
+                list_element(
+                    get_field().call(vec![col("s"), datafusion_expr::lit("l")]),
+                    &["b"],
+                ),
+                vec![5],
+                "s",
+                DataType::Struct(
+                    vec![Field::new("l", narrowed_list("b", DataType::Utf8), true)]
+                        .into(),
+                ),
+            ),
+        ] {
+            let plan = build_projection_read_plan(
+                vec![logical2physical(&expr, &schema)],
+                &schema,
+                &schema_descr,
+            );
+            assert_eq!(
+                plan.projection_mask,
+                ProjectionMask::leaves(&schema_descr, leaves),
+                "{expr}"
+            );
+            assert_eq!(
+                plan.projected_schema
+                    .field_with_name(root)
+                    .unwrap()
+                    .data_type(),
+                &root_type,
+                "{expr}"
+            );
+        }
+    }
+
+    /// A cast of an element access reads only the element fields its target
+    /// names, and the whole element when every field is consumed.
+    #[test]
+    fn build_projection_read_plan_clips_element_casts() {
+        let (schema, schema_descr) = struct_list_schema();
+        let s_l = get_field().call(vec![col("s"), datafusion_expr::lit("l")]);
+        let target = |fields: Vec<Field>| DataType::Struct(fields.into());
+        for (source, target, leaves) in [
+            (
+                col("l"),
+                target(vec![
+                    Field::new("g", DataType::Utf8, true),
+                    Field::new("h", DataType::Int32, true),
+                ]),
+                vec![2],
+            ),
+            (
+                s_l,
+                target(vec![Field::new("a", DataType::Int64, true)]),
+                vec![4],
+            ),
+            (
+                col("l"),
+                target(vec![
+                    Field::new("f", DataType::Int64, true),
+                    Field::new("g", DataType::Utf8, true),
+                ]),
+                vec![1, 2],
+            ),
+        ] {
+            let element = logical2physical(&list_element(source, &[]), &schema);
+            let cast: Arc<dyn PhysicalExpr> =
+                Arc::new(CastExpr::new(element, target, None));
+            let plan = build_projection_read_plan(
+                vec![Arc::clone(&cast)],
+                &schema,
+                &schema_descr,
+            );
+            assert_eq!(
+                plan.projection_mask,
+                ProjectionMask::leaves(&schema_descr, leaves),
+                "{cast}"
+            );
+        }
+    }
+
+    /// The whole element, the whole List beside an element access, and
+    /// element accesses beside a Struct field access each read what they use.
+    #[test]
+    fn build_projection_read_plan_combines_element_accesses() {
+        let (schema, schema_descr) = struct_list_schema();
+        for (exprs, leaves) in [
+            (vec![list_element(col("l"), &[])], vec![1, 2]),
+            (vec![col("l"), list_element(col("l"), &["f"])], vec![1, 2]),
+            (
+                vec![
+                    list_element(col("l"), &["f"]),
+                    list_element(col("l"), &["g"]),
+                ],
+                vec![1, 2],
+            ),
+            (
+                vec![
+                    list_element(col("l"), &["f"]),
+                    get_field().call(vec![col("s"), datafusion_expr::lit("x")]),
+                ],
+                vec![1, 3],
+            ),
+        ] {
+            let plan = build_projection_read_plan(
+                exprs.iter().map(|expr| logical2physical(expr, &schema)),
+                &schema,
+                &schema_descr,
+            );
+            assert_eq!(
+                plan.projection_mask,
+                ProjectionMask::leaves(&schema_descr, leaves),
+                "{exprs:?}"
+            );
+        }
+    }
+
+    /// `array_transform(list, param -> body(param))`.
+    fn transform(list: Expr, param: &str, body: impl FnOnce(Expr) -> Expr) -> Expr {
+        datafusion_functions_nested::expr_fn::array_transform(
+            list,
+            datafusion_expr::lambda([param], body(datafusion_expr::lambda_var(param))),
+        )
+    }
+
+    /// `expr` with its lambda variables resolved, planned over `schema`.
+    fn plan_with_lambdas(expr: &Expr, schema: &Schema) -> Arc<dyn PhysicalExpr> {
+        let df_schema = schema.clone().to_dfschema().unwrap();
+        let expr = expr
+            .clone()
+            .resolve_lambda_variables(&df_schema)
+            .unwrap()
+            .data;
+        logical2physical(&expr, schema)
+    }
+
+    /// `ll: List<Struct<n: Int32, items: List<Struct<a: Int32, b: Utf8>>,
+    /// m: Map<Utf8, Int32>>>`. Parquet leaves: n=0, items.a=1, items.b=2,
+    /// m.key=3, m.value=4.
+    fn nested_list_schema() -> (SchemaRef, SchemaDescriptor) {
+        let items = DataType::new_list(
+            DataType::Struct(
+                vec![
+                    Field::new("a", DataType::Int32, true),
+                    Field::new("b", DataType::Utf8, true),
+                ]
+                .into(),
+            ),
+            true,
+        );
+        let map = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("key", DataType::Utf8, false),
+                        Field::new("value", DataType::Int32, true),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        let element = DataType::Struct(
+            vec![
+                Field::new("n", DataType::Int32, true),
+                Field::new("items", items, true),
+                Field::new("m", map, true),
+            ]
+            .into(),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ll",
+            DataType::new_list(element, true),
+            true,
+        )]));
+        let schema_descr = ArrowSchemaConverter::new().convert(&schema).unwrap();
+        (schema, schema_descr)
+    }
+
+    /// A list element lambda reads, below its List, only the element leaves
+    /// its body reads through the parameter: through Struct fields, nested
+    /// lambdas, and captured columns. A parameter used whole or never read
+    /// reads the whole element; a shadowed parameter reads nothing of the
+    /// outer List; a path through a Map reads the Map.
+    #[test]
+    fn build_projection_read_plan_follows_list_element_lambdas() {
+        let (schema, schema_descr) = struct_list_schema();
+        let field = |expr: Expr, name: &str| {
+            get_field().call(vec![expr, datafusion_expr::lit(name)])
+        };
+        for (expr, leaves) in [
+            (transform(col("l"), "x", |x| field(x, "f")), vec![1]),
+            (
+                transform(field(col("s"), "l"), "x", |x| field(x, "b")),
+                vec![5],
+            ),
+            (transform(col("l"), "x", |x| x), vec![1, 2]),
+            (
+                transform(col("l"), "x", |_| datafusion_expr::lit(1)),
+                vec![1, 2],
+            ),
+            (
+                transform(col("l"), "x", |x| field(x, "f") + col("id")),
+                vec![0, 1],
+            ),
+            (
+                transform(col("l"), "x", |x| field(col("s"), "x") + field(x, "f")),
+                vec![1, 3],
+            ),
+            (
+                transform(col("l"), "x", |x| {
+                    transform(
+                        datafusion_functions_nested::expr_fn::make_array(vec![field(
+                            x, "g",
+                        )]),
+                        "x",
+                        |x| x,
+                    )
+                }),
+                vec![2],
+            ),
+        ] {
+            let plan = build_projection_read_plan(
+                vec![plan_with_lambdas(&expr, &schema)],
+                &schema,
+                &schema_descr,
+            );
+            assert_eq!(
+                plan.projection_mask,
+                ProjectionMask::leaves(&schema_descr, leaves),
+                "{expr}"
+            );
+        }
+
+        let (schema, schema_descr) = nested_list_schema();
+        for (expr, leaves) in [
+            (
+                transform(col("ll"), "x", |x| {
+                    transform(field(x, "items"), "y", |y| field(y, "b"))
+                }),
+                vec![2],
+            ),
+            (
+                transform(col("ll"), "x", |x| field(field(x, "m"), "k")),
+                vec![3, 4],
+            ),
+        ] {
+            let plan = build_projection_read_plan(
+                vec![plan_with_lambdas(&expr, &schema)],
+                &schema,
+                &schema_descr,
+            );
+            assert_eq!(
+                plan.projection_mask,
+                ProjectionMask::leaves(&schema_descr, leaves),
+                "{expr}"
+            );
+        }
+    }
+
+    /// Rebased onto the narrowed read, a list element lambda evaluates over
+    /// the decoded leaves to what it evaluates to over the whole file,
+    /// including empty and null Lists.
+    #[test]
+    fn rebased_list_element_lambdas_evaluate_over_narrowed_reads() {
+        let element: Fields = vec![
+            Field::new("f", DataType::Int32, true),
+            Field::new("g", DataType::Utf8, true),
+        ]
+        .into();
+        let elements = StructArray::new(
+            element.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as _,
+                Arc::new(StringArray::from(vec!["a", "b", "c"])) as _,
+            ],
+            None,
+        );
+        let item = Arc::new(Field::new_list_field(DataType::Struct(element), true));
+        let l = ListArray::new(
+            item,
+            OffsetBuffer::from_lengths([2, 0, 0, 1]),
+            Arc::new(elements),
+            Some(NullBuffer::from(vec![true, true, false, true])),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "l",
+            l.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(l)]).unwrap();
+        let file = NamedTempFile::new().expect("temp file");
+        let mut writer =
+            ArrowWriter::try_new(file.reopen().unwrap(), Arc::clone(&schema), None)
+                .expect("writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file.reopen().unwrap())
+            .expect("reader builder");
+        let file_schema = Arc::clone(builder.schema());
+        let schema_descr = builder.metadata().file_metadata().schema_descr_ptr();
+        let full = builder.build().unwrap().next().unwrap().unwrap();
+
+        let f = |x: Expr| get_field().call(vec![x, datafusion_expr::lit("f")]);
+        for expr in [
+            transform(col("l"), "x", f),
+            transform(col("l"), "x", |x| {
+                transform(
+                    datafusion_functions_nested::expr_fn::make_array(vec![f(x)]),
+                    "y",
+                    |y| y,
+                )
+            }),
+        ] {
+            let expr = plan_with_lambdas(&expr, &file_schema);
+            let plan = build_projection_read_plan(
+                vec![Arc::clone(&expr)],
+                &file_schema,
+                &schema_descr,
+            );
+            assert_eq!(
+                plan.projection_mask,
+                ProjectionMask::leaves(&schema_descr, [0]),
+                "{expr}"
+            );
+            let narrowed =
+                ParquetRecordBatchReaderBuilder::try_new(file.reopen().unwrap())
+                    .unwrap()
+                    .with_projection(plan.projection_mask.clone())
+                    .build()
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(narrowed.schema(), plan.projected_schema);
+            let rebased =
+                rebase_onto_read(Arc::clone(&expr), &plan.projected_schema, &file_schema)
+                    .unwrap();
+            assert_eq!(
+                rebased
+                    .evaluate(&narrowed)
+                    .unwrap()
+                    .into_array(narrowed.num_rows())
+                    .unwrap()
+                    .as_ref(),
+                expr.evaluate(&full)
+                    .unwrap()
+                    .into_array(full.num_rows())
+                    .unwrap()
+                    .as_ref(),
+                "{expr}"
+            );
+        }
     }
 
     #[test]
@@ -2351,6 +3283,7 @@ mod test {
             &[],
             &[access(1, &["nonexistent"])],
             &[cast],
+            &[],
         );
 
         assert_eq!(
@@ -2526,6 +3459,7 @@ mod test {
                     vec![Arc::new(Field::new("p", DataType::Int32, true))].into(),
                 ),
             }],
+            &[],
         );
 
         assert_eq!(

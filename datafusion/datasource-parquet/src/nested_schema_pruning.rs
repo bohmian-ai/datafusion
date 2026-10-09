@@ -181,6 +181,21 @@ pub(crate) fn contains_struct(dt: &DataType) -> bool {
     matches!(dt, DataType::Struct(_)) || nested_child(dt).is_some_and(contains_struct)
 }
 
+/// Whether `dt` holds, at any Struct nesting level, a List or LargeList whose
+/// elements contain a Struct: the only Lists below which a read can select
+/// some leaves and skip others.
+pub(crate) fn contains_struct_list(dt: &DataType) -> bool {
+    match dt {
+        DataType::List(element) | DataType::LargeList(element) => {
+            contains_struct(element.data_type())
+        }
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| contains_struct_list(field.data_type())),
+        _ => false,
+    }
+}
+
 /// Above this many target fields, matching physical children against them one
 /// by one turns into a quadratic string comparison; build a name lookup
 /// instead. Below it the map's allocation costs more than the linear scan it
@@ -491,6 +506,40 @@ mod tests {
             Arc::new(Field::new(
                 "entries",
                 struct_of(vec![utf8("key"), int64("value")]),
+                false
+            )),
+            false
+        )));
+    }
+
+    /// Only Lists whose elements contain a Struct, at any Struct nesting
+    /// level, have leaves a read can select.
+    #[test]
+    fn contains_struct_list_shapes() {
+        let element = struct_of(vec![int64("a"), utf8("b")]);
+        assert!(!contains_struct_list(&DataType::Int32));
+        assert!(!contains_struct_list(&element));
+        assert!(!contains_struct_list(&list_of(DataType::Int32)));
+        assert!(contains_struct_list(&list_of(element.clone())));
+        assert!(contains_struct_list(&list_of(list_of(element.clone()))));
+        assert!(contains_struct_list(&DataType::LargeList(Arc::new(
+            Field::new("item", element.clone(), true)
+        ))));
+        assert!(contains_struct_list(&struct_of(vec![Field::new(
+            "l",
+            list_of(element.clone()),
+            true
+        )])));
+        assert!(!contains_struct_list(&struct_of(vec![Field::new(
+            "l",
+            list_of(DataType::Int32),
+            true
+        )])));
+        // Map entries are not selected by position.
+        assert!(!contains_struct_list(&DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                struct_of(vec![utf8("key"), Field::new("value", element, true)]),
                 false
             )),
             false
