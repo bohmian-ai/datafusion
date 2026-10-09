@@ -76,15 +76,18 @@ impl EncryptionContext {
 
 #[cfg(not(feature = "parquet_encryption"))]
 #[expect(dead_code)]
-#[expect(clippy::unused_async)]
 impl EncryptionContext {
-    pub(super) async fn get_file_decryption_properties(
+    pub(super) fn get_file_decryption_properties(
         &self,
         _file_location: &object_store::path::Path,
-    ) -> Result<
-        Option<std::sync::Arc<datafusion_common::encryption::FileDecryptionProperties>>,
+    ) -> std::future::Ready<
+        Result<
+            Option<
+                std::sync::Arc<datafusion_common::encryption::FileDecryptionProperties>,
+            >,
+        >,
     > {
-        Ok(None)
+        std::future::ready(Ok(None))
     }
 }
 
