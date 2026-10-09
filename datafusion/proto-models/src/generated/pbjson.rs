@@ -7677,9 +7677,6 @@ impl serde::Serialize for FileScanExecConf {
         if self.preserve_order.is_some() {
             len += 1;
         }
-        if self.expr_adapter_factory.is_some() {
-            len += 1;
-        }
         let mut struct_ser = serializer.serialize_struct("datafusion.FileScanExecConf", len)?;
         if !self.file_groups.is_empty() {
             struct_ser.serialize_field("fileGroups", &self.file_groups)?;
@@ -7727,11 +7724,6 @@ impl serde::Serialize for FileScanExecConf {
         if let Some(v) = self.preserve_order.as_ref() {
             struct_ser.serialize_field("preserveOrder", v)?;
         }
-        if let Some(v) = self.expr_adapter_factory.as_ref() {
-            #[allow(clippy::needless_borrow)]
-            #[allow(clippy::needless_borrows_for_generic_args)]
-            struct_ser.serialize_field("exprAdapterFactory", pbjson::private::base64::encode(&v).as_str())?;
-        }
         struct_ser.end()
     }
 }
@@ -7765,8 +7757,6 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
             "fileCompressionType",
             "preserve_order",
             "preserveOrder",
-            "expr_adapter_factory",
-            "exprAdapterFactory",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -7785,7 +7775,6 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
             OutputPartitioning,
             FileCompressionType,
             PreserveOrder,
-            ExprAdapterFactory,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -7821,7 +7810,6 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                             "outputPartitioning" | "output_partitioning" => Ok(GeneratedField::OutputPartitioning),
                             "fileCompressionType" | "file_compression_type" => Ok(GeneratedField::FileCompressionType),
                             "preserveOrder" | "preserve_order" => Ok(GeneratedField::PreserveOrder),
-                            "exprAdapterFactory" | "expr_adapter_factory" => Ok(GeneratedField::ExprAdapterFactory),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -7855,7 +7843,6 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                 let mut output_partitioning__ = None;
                 let mut file_compression_type__ = None;
                 let mut preserve_order__ = None;
-                let mut expr_adapter_factory__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::FileGroups => {
@@ -7947,14 +7934,6 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                             }
                             preserve_order__ = map_.next_value()?;
                         }
-                        GeneratedField::ExprAdapterFactory => {
-                            if expr_adapter_factory__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("exprAdapterFactory"));
-                            }
-                            expr_adapter_factory__ = 
-                                map_.next_value::<::std::option::Option<::pbjson::private::BytesDeserialize<_>>>()?.map(|x| x.0)
-                            ;
-                        }
                     }
                 }
                 Ok(FileScanExecConf {
@@ -7972,7 +7951,6 @@ impl<'de> serde::Deserialize<'de> for FileScanExecConf {
                     output_partitioning: output_partitioning__,
                     file_compression_type: file_compression_type__,
                     preserve_order: preserve_order__,
-                    expr_adapter_factory: expr_adapter_factory__,
                 })
             }
         }

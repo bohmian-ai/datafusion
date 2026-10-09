@@ -1314,9 +1314,6 @@ message FileScanExecConf {
   // Whether file processing order must be preserved. Absent payloads retain the
   // legacy behavior of deriving this from output_ordering.
   optional bool preserve_order = 17;
-  // A non-default `PhysicalExprAdapterFactory`, serialized by the
-  // `PhysicalExtensionCodec`. Absent means the default adapter.
-  optional bytes expr_adapter_factory = 18;
 }
 
 message ParquetScanExecNode {

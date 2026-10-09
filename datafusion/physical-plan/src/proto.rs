@@ -66,7 +66,6 @@ use datafusion_execution::TaskContext;
 use datafusion_expr::physical_planning_context::ScalarSubqueryResults;
 use datafusion_expr::{AggregateUDF, ScalarUDF, WindowUDF};
 use datafusion_physical_expr::PhysicalExpr;
-use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::proto_decode::{
     PhysicalExprDecode, PhysicalExprDecodeCtx,
 };
@@ -105,18 +104,6 @@ pub trait ExecutionPlanEncode {
     /// Serialize a window UDF to an opaque payload. `None` means "decodable by
     /// name alone".
     fn encode_udwf(&self, udwf: &WindowUDF) -> Result<Option<Vec<u8>>>;
-
-    /// Serialize a non-default expression adapter factory to an opaque
-    /// payload. Errors when no codec can represent the factory, so a scan is
-    /// never decoded with a different adapter than it was planned with.
-    fn encode_expr_adapter_factory(
-        &self,
-        _factory: &Arc<dyn PhysicalExprAdapterFactory>,
-    ) -> Result<Vec<u8>> {
-        datafusion_common::not_impl_err!(
-            "FileScanConfig with a non-default expr_adapter_factory cannot be serialized"
-        )
-    }
 }
 
 /// Internal dispatch trait backing [`ExecutionPlanDecodeCtx`].
@@ -166,17 +153,6 @@ pub trait ExecutionPlanDecode {
 
     /// Reconstruct a window UDF from its name and optional payload.
     fn decode_udwf(&self, name: &str, payload: Option<&[u8]>) -> Result<Arc<WindowUDF>>;
-
-    /// Reconstruct an expression adapter factory from the payload
-    /// [`ExecutionPlanEncode::encode_expr_adapter_factory`] produced.
-    fn decode_expr_adapter_factory(
-        &self,
-        _payload: &[u8],
-    ) -> Result<Arc<dyn PhysicalExprAdapterFactory>> {
-        datafusion_common::not_impl_err!(
-            "no codec decodes a serialized expr_adapter_factory"
-        )
-    }
 }
 
 /// Context handed to [`ExecutionPlan::try_to_proto`].
@@ -239,14 +215,6 @@ impl<'a> ExecutionPlanEncodeCtx<'a> {
     /// Serialize a window UDF to an opaque payload (`None` = decodable by name).
     pub fn encode_udwf(&self, udwf: &WindowUDF) -> Result<Option<Vec<u8>>> {
         self.encoder.encode_udwf(udwf)
-    }
-
-    /// Serialize a non-default expression adapter factory to an opaque payload.
-    pub fn encode_expr_adapter_factory(
-        &self,
-        factory: &Arc<dyn PhysicalExprAdapterFactory>,
-    ) -> Result<Vec<u8>> {
-        self.encoder.encode_expr_adapter_factory(factory)
     }
 
     /// An expression-level encode context backed by this plan context.
@@ -373,14 +341,6 @@ impl<'a> ExecutionPlanDecodeCtx<'a> {
         payload: Option<&[u8]>,
     ) -> Result<Arc<WindowUDF>> {
         self.decoder.decode_udwf(name, payload)
-    }
-
-    /// Reconstruct an expression adapter factory from its payload.
-    pub fn decode_expr_adapter_factory(
-        &self,
-        payload: &[u8],
-    ) -> Result<Arc<dyn PhysicalExprAdapterFactory>> {
-        self.decoder.decode_expr_adapter_factory(payload)
     }
 
     /// An expression-level decode context backed by this plan context, bound to

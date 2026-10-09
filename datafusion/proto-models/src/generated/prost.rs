@@ -2021,10 +2021,6 @@ pub struct FileScanExecConf {
     /// legacy behavior of deriving this from output_ordering.
     #[prost(bool, optional, tag = "17")]
     pub preserve_order: ::core::option::Option<bool>,
-    /// A non-default `PhysicalExprAdapterFactory`, serialized by the
-    /// `PhysicalExtensionCodec`. Absent means the default adapter.
-    #[prost(bytes = "vec", optional, tag = "18")]
-    pub expr_adapter_factory: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ParquetScanExecNode {

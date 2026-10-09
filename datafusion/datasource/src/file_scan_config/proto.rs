@@ -90,14 +90,16 @@ impl FileScanConfig {
             output_partitioning,
         } = self;
 
-        // A non-default factory is executable behavior; the extension codec
-        // serializes it, and refuses when it cannot, so a scan is never
-        // decoded with a different adapter than it was planned with.
-        let expr_adapter_factory = expr_adapter_factory
+        // Non-default factories are executable behavior with no protobuf
+        // representation; silently replacing one can change scan results.
+        if expr_adapter_factory
             .as_ref()
-            .filter(|factory| !factory.is_equivalent_to_default())
-            .map(|factory| ctx.encode_expr_adapter_factory(factory))
-            .transpose()?;
+            .is_some_and(|factory| !factory.is_equivalent_to_default())
+        {
+            return datafusion_common::not_impl_err!(
+                "FileScanConfig with a non-default expr_adapter_factory cannot be serialized"
+            );
+        }
 
         let proto_file_groups = file_groups
             .iter()
@@ -174,7 +176,6 @@ impl FileScanConfig {
             output_partitioning: proto_output_partitioning,
             file_compression_type: proto_file_compression_type,
             preserve_order: Some(*preserve_order),
-            expr_adapter_factory,
         })
     }
 
@@ -210,7 +211,6 @@ impl FileScanConfig {
             output_partitioning,
             file_compression_type,
             preserve_order,
-            expr_adapter_factory,
         } = conf;
 
         let expression_schema = parse_file_scan_schema(proto_schema.as_ref())?;
@@ -329,12 +329,6 @@ impl FileScanConfig {
                 .with_output_partitioning(decoded_output_partitioning)
                 .with_batch_size(decoded_batch_size)
                 .with_file_compression_type(decoded_file_compression_type)
-                .with_expr_adapter(
-                    expr_adapter_factory
-                        .as_deref()
-                        .map(|payload| ctx.decode_expr_adapter_factory(payload))
-                        .transpose()?,
-                )
                 .build();
 
         // Presence distinguishes a new explicit `false` from a legacy payload,

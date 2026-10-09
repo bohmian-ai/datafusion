@@ -45,7 +45,6 @@ use datafusion_expr::{AggregateUDF, HigherOrderUDF, ScalarUDF, WindowUDF};
 use datafusion_functions_table::generate_series::{
     Empty, GenSeriesArgs, GenerateSeriesTable, GenericSeriesState, TimestampValue,
 };
-use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::proto_decode::PhysicalExprDecodeCtx;
 use datafusion_physical_expr_common::physical_expr::proto_encode::PhysicalExprEncodeCtx;
 use datafusion_physical_plan::aggregates::AggregateExec;
@@ -316,19 +315,15 @@ mod file_scan_config_serde {
     }
 
     struct FileScanSerdeHarness {
-        codec: Box<dyn PhysicalExtensionCodec>,
+        codec: DefaultPhysicalExtensionCodec,
         converter: DefaultPhysicalProtoConverter,
         task_ctx: TaskContext,
     }
 
     impl FileScanSerdeHarness {
         fn new() -> Self {
-            Self::with_codec(Box::new(DefaultPhysicalExtensionCodec {}))
-        }
-
-        fn with_codec(codec: Box<dyn PhysicalExtensionCodec>) -> Self {
             Self {
-                codec,
+                codec: DefaultPhysicalExtensionCodec {},
                 converter: DefaultPhysicalProtoConverter {},
                 task_ctx: TaskContext::default(),
             }
@@ -336,7 +331,7 @@ mod file_scan_config_serde {
 
         fn encode(&self, config: &FileScanConfig) -> Result<protobuf::FileScanExecConf> {
             let encoder = ConverterPlanEncoder {
-                codec: self.codec.as_ref(),
+                codec: &self.codec,
                 proto_converter: &self.converter,
             };
             config.try_to_proto(&ExecutionPlanEncodeCtx::new(&encoder))
@@ -352,7 +347,7 @@ mod file_scan_config_serde {
             file_source: Arc<dyn FileSource>,
         ) -> Result<FileScanConfig> {
             let physical_decode_ctx =
-                PhysicalPlanDecodeContext::new(&self.task_ctx, self.codec.as_ref());
+                PhysicalPlanDecodeContext::new(&self.task_ctx, &self.codec);
             let decoder = ConverterPlanDecoder {
                 ctx: &physical_decode_ctx,
                 proto_converter: &self.converter,
@@ -451,67 +446,6 @@ mod file_scan_config_serde {
             err.to_string().contains("expr_adapter_factory"),
             "unexpected error: {err}"
         );
-        Ok(())
-    }
-
-    /// Codec that serializes [`SerdeTestExprAdapterFactory`] as an empty
-    /// payload, so a scan planned with it decodes with it.
-    #[derive(Debug)]
-    struct AdapterCodec;
-
-    impl PhysicalExtensionCodec for AdapterCodec {
-        fn try_decode(
-            &self,
-            _buf: &[u8],
-            _inputs: &[Arc<dyn ExecutionPlan>],
-            _ctx: &TaskContext,
-            _proto_converter: &dyn PhysicalProtoConverterExtension,
-        ) -> Result<Arc<dyn ExecutionPlan>> {
-            not_impl_err!("plans are not decoded by this codec")
-        }
-
-        fn try_encode(
-            &self,
-            _node: Arc<dyn ExecutionPlan>,
-            _buf: &mut Vec<u8>,
-            _proto_converter: &dyn PhysicalProtoConverterExtension,
-        ) -> Result<()> {
-            not_impl_err!("plans are not encoded by this codec")
-        }
-
-        fn try_encode_expr_adapter_factory(
-            &self,
-            factory: &Arc<dyn PhysicalExprAdapterFactory>,
-            _buf: &mut Vec<u8>,
-        ) -> Result<()> {
-            if format!("{factory:?}") == "SerdeTestExprAdapterFactory" {
-                Ok(())
-            } else {
-                not_impl_err!("unknown expr_adapter_factory")
-            }
-        }
-
-        fn try_decode_expr_adapter_factory(
-            &self,
-            _buf: &[u8],
-        ) -> Result<Arc<dyn PhysicalExprAdapterFactory>> {
-            Ok(Arc::new(SerdeTestExprAdapterFactory))
-        }
-    }
-
-    #[test]
-    fn new_file_scan_config_round_trips_a_codec_expr_adapter_factory() -> Result<()> {
-        let serde = FileScanSerdeHarness::with_codec(Box::new(AdapterCodec));
-        let config = FileScanConfigBuilder::from(test_config(None))
-            .with_expr_adapter(Some(Arc::new(SerdeTestExprAdapterFactory)))
-            .build();
-        let encoded = serde.encode(&config)?;
-        assert!(encoded.expr_adapter_factory.is_some());
-        let decoded = serde.decode(&encoded)?;
-        let factory = decoded
-            .expr_adapter_factory
-            .expect("the codec's adapter is decoded");
-        assert_eq!(format!("{factory:?}"), "SerdeTestExprAdapterFactory");
         Ok(())
     }
 
@@ -1823,28 +1757,6 @@ pub trait PhysicalExtensionCodec: Debug + Send + Sync + Any {
     fn try_encode_udwf(&self, _node: &WindowUDF, _buf: &mut Vec<u8>) -> Result<()> {
         Ok(())
     }
-
-    /// Encode a file scan's non-default [`PhysicalExprAdapterFactory`] into
-    /// `buf`. The default refuses, so a scan whose adapter no codec can
-    /// represent fails to serialize instead of decoding with another adapter.
-    fn try_encode_expr_adapter_factory(
-        &self,
-        _factory: &Arc<dyn PhysicalExprAdapterFactory>,
-        _buf: &mut Vec<u8>,
-    ) -> Result<()> {
-        not_impl_err!(
-            "FileScanConfig with a non-default expr_adapter_factory cannot be serialized"
-        )
-    }
-
-    /// Decode a [`PhysicalExprAdapterFactory`] that
-    /// [`Self::try_encode_expr_adapter_factory`] wrote into `buf`.
-    fn try_decode_expr_adapter_factory(
-        &self,
-        _buf: &[u8],
-    ) -> Result<Arc<dyn PhysicalExprAdapterFactory>> {
-        not_impl_err!("PhysicalExtensionCodec is not provided for expr_adapter_factory")
-    }
 }
 
 #[derive(Debug)]
@@ -2222,25 +2134,6 @@ impl PhysicalExtensionCodec for ComposedPhysicalExtensionCodec {
     fn try_encode_udaf(&self, node: &AggregateUDF, buf: &mut Vec<u8>) -> Result<()> {
         self.encode_protobuf(buf, |codec, data| codec.try_encode_udaf(node, data))
     }
-
-    fn try_encode_expr_adapter_factory(
-        &self,
-        factory: &Arc<dyn PhysicalExprAdapterFactory>,
-        buf: &mut Vec<u8>,
-    ) -> Result<()> {
-        self.encode_protobuf(buf, |codec, data| {
-            codec.try_encode_expr_adapter_factory(factory, data)
-        })
-    }
-
-    fn try_decode_expr_adapter_factory(
-        &self,
-        buf: &[u8],
-    ) -> Result<Arc<dyn PhysicalExprAdapterFactory>> {
-        self.decode_protobuf(buf, |codec, data| {
-            codec.try_decode_expr_adapter_factory(data)
-        })
-    }
 }
 
 /// Adapter backing [`ExecutionPlanEncodeCtx`] for plans migrated to the
@@ -2286,16 +2179,6 @@ impl ExecutionPlanEncode for ConverterPlanEncoder<'_> {
         let mut buf = vec![];
         self.codec.try_encode_udwf(udwf, &mut buf)?;
         Ok((!buf.is_empty()).then_some(buf))
-    }
-
-    fn encode_expr_adapter_factory(
-        &self,
-        factory: &Arc<dyn PhysicalExprAdapterFactory>,
-    ) -> Result<Vec<u8>> {
-        let mut buf = vec![];
-        self.codec
-            .try_encode_expr_adapter_factory(factory, &mut buf)?;
-        Ok(buf)
     }
 }
 
@@ -2377,12 +2260,5 @@ impl ExecutionPlanDecode for ConverterPlanDecoder<'_, '_> {
                 .udwf(name)
                 .or_else(|_| self.ctx.codec().try_decode_udwf(name, &[])),
         }
-    }
-
-    fn decode_expr_adapter_factory(
-        &self,
-        payload: &[u8],
-    ) -> Result<Arc<dyn PhysicalExprAdapterFactory>> {
-        self.ctx.codec().try_decode_expr_adapter_factory(payload)
     }
 }
