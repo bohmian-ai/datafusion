@@ -528,6 +528,48 @@ async fn shredded_paths_read_only_their_leaves() -> Result<()> {
     Ok(())
 }
 
+/// A filter pushed into the scan still applies to a file whose shredded
+/// Variant lacks the extension type: the reader converts that column with a
+/// cast the targeted decoder filter cannot read through, so the filter reads
+/// the whole column instead of being dropped.
+#[tokio::test]
+async fn pushed_filter_applies_to_a_variant_without_its_extension() -> Result<()> {
+    let text: ArrayRef = Arc::new(StringArray::from(vec![
+        r#"{"a":1}"#,
+        r#"{"a":2}"#,
+        r#"{"a":"2"}"#,
+        r#"{"b":3}"#,
+    ]));
+    let object =
+        DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int64, true)]));
+    let v =
+        ArrayRef::from(shred_variant(&json_to_variant(&text).unwrap(), &object).unwrap());
+    let batch = RecordBatch::try_from_iter([("v", v)]).unwrap();
+    let ctx = table(
+        &batch,
+        None,
+        Arc::new(Schema::new(vec![variant_field("v")])),
+    )
+    .await;
+    for pushdown in [false, true] {
+        ctx.sql(&format!(
+            "SET datafusion.execution.parquet.pushdown_filters = {pushdown}"
+        ))
+        .await?
+        .collect()
+        .await?;
+        let values =
+            column(&ctx, "SELECT v ->> 'a' FROM t WHERE v ->> 'a' = '2'").await?;
+        let values = arrow::compute::cast(&values, &DataType::Utf8)?;
+        assert_eq!(
+            values.as_string::<i32>().iter().collect::<Vec<_>>(),
+            vec![Some("2"), Some("2")],
+            "pushdown_filters = {pushdown}"
+        );
+    }
+    Ok(())
+}
+
 /// Row groups the Parquet scans under `plan` skipped by statistics.
 fn row_groups_pruned(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> usize {
     use datafusion::physical_plan::metrics::MetricValue;

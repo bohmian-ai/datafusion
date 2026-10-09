@@ -611,6 +611,14 @@ impl<'schema> PushdownChecker<'schema> {
         self.non_primitive_columns || self.projected_columns || self.has_unpushable_udfs
     }
 
+    /// Returns true when the only obstacle to pushdown is a nested column
+    /// read whole: every column is in the file schema and every function can
+    /// run inside a row filter, so the expression can still be evaluated by
+    /// decoding its columns' roots in full.
+    pub(crate) fn only_nested_columns_prevent_pushdown(&self) -> bool {
+        self.non_primitive_columns && !self.projected_columns && !self.has_unpushable_udfs
+    }
+
     /// Consumes the checker and returns sorted, deduplicated column indices
     /// wrapped in a `PushdownColumns` struct.
     ///

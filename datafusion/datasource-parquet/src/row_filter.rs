@@ -78,6 +78,7 @@ use parquet::file::metadata::ParquetMetaData;
 use datafusion_common::Result;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::tree_node::TreeNode;
+use datafusion_physical_expr::utils::collect_columns;
 #[cfg(test)]
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
@@ -105,7 +106,9 @@ use crate::projection_read_plan::{
 /// * References struct fields via `get_field` where the accessed leaf
 ///   is a primitive type (e.g. `get_field(struct_col, 'field') > 5`).
 ///   Direct references to whole struct columns are still evaluated after
-///   decoding.
+///   decoding, unless the filter was accepted against the table schema and
+///   only this file's layout prevents a narrower read; such a filter decodes
+///   its columns' roots in full.
 #[derive(Debug)]
 pub(crate) struct DatafusionArrowPredicate {
     /// the filter expression
@@ -224,17 +227,63 @@ impl FilterCandidateBuilder {
     /// * `Ok(Some(candidate))` if the expression can be used as an ArrowFilter
     /// * `Ok(None)` if the expression cannot be used as an ArrowFilter
     /// * `Err(e)` if an error occurs while building the candidate
+    ///
+    /// An expression the targeted read cannot serve only because it uses a
+    /// nested column whole falls back to decoding the roots of every column
+    /// it references. A predicate reaching the decoder is relied on to filter:
+    /// [`ParquetSource::try_pushdown_filters`](crate::source::ParquetSource)
+    /// accepts it against the table schema, and a file whose column has
+    /// another nested shape (a Struct cast added by schema adaptation, for
+    /// example) must still apply it rather than silently return every row.
     pub fn build(self, metadata: &ParquetMetaData) -> Result<Option<FilterCandidate>> {
+        let read_plan =
+            match build_parquet_read_plan(&self.expr, &self.file_schema, metadata)? {
+                Some(read_plan) => Some(read_plan),
+                None => whole_root_read_plan(&self.expr, &self.file_schema, metadata)?,
+            };
         Ok(
-            build_parquet_read_plan(&self.expr, &self.file_schema, metadata)?.map(
-                |(read_plan, required_bytes)| FilterCandidate {
-                    expr: self.expr,
-                    required_bytes,
-                    read_plan,
-                },
-            ),
+            read_plan.map(|(read_plan, required_bytes)| FilterCandidate {
+                expr: self.expr,
+                required_bytes,
+                read_plan,
+            }),
         )
     }
+}
+
+/// Plans decoding the whole root of every column `expr` references.
+///
+/// Returns `Ok(None)` unless the only reason `expr` cannot be pushed down is a
+/// nested column used whole (see
+/// [`PushdownChecker::only_nested_columns_prevent_pushdown`]); a missing column
+/// or a function that needs the reader's rewrite still cannot be evaluated by
+/// a row filter. The required bytes cover every leaf below those roots.
+fn whole_root_read_plan(
+    expr: &Arc<dyn PhysicalExpr>,
+    file_schema: &Schema,
+    metadata: &ParquetMetaData,
+) -> Result<Option<(ParquetReadPlan, usize)>> {
+    let mut checker = PushdownChecker::new(file_schema, true, true);
+    expr.visit(&mut checker)?;
+    if !checker.only_nested_columns_prevent_pushdown() {
+        return Ok(None);
+    }
+    let Ok(mut roots) = collect_columns(expr)
+        .iter()
+        .map(|column| file_schema.index_of(column.name()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+    else {
+        return Ok(None);
+    };
+    roots.sort_unstable();
+    roots.dedup();
+    let (read_plan, leaf_indices) = assemble_read_plan(
+        &roots,
+        &[],
+        file_schema,
+        metadata.file_metadata().schema_descr(),
+    );
+    Ok(Some((read_plan, size_of_columns(&leaf_indices, metadata)?)))
 }
 
 /// Checks if a given expression can be pushed down to the parquet decoder.
