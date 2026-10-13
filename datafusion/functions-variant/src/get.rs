@@ -19,7 +19,9 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, StringBuilder};
+use arrow::array::{Array, ArrayRef, StringBuilder, make_array};
+use arrow::buffer::NullBuffer;
+use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, FieldRef, Fields};
 use datafusion_common::nested_struct::is_variant;
 use datafusion_common::{Result, ScalarValue, plan_err};
@@ -223,12 +225,19 @@ impl ScalarUDFImpl for VariantGet {
             }
             Some(path) => {
                 let path = VariantPath::new(path.into_iter().flatten().collect());
-                // Asking for Variant output keeps a key arrow-rs proves
-                // missing a null Variant rather than an untyped `NullArray`.
-                let options = GetOptions::new_with_path(path)
-                    .with_as_type(Some(Arc::new(variant_field(self.name(), true))));
+                // No requested type keeps a shredded leaf shredded, so a
+                // string column renders without row-wise decoding. A key
+                // arrow-rs proves missing comes back as an untyped
+                // `NullArray`, which is a null Variant in every row.
                 let root: ArrayRef = root.into();
-                VariantArray::try_new(variant_get(&root, options)?.as_ref())?
+                let found = variant_get(&root, GetOptions::new_with_path(path))?;
+                if found.data_type() == &DataType::Null {
+                    let mut builder = VariantArrayBuilder::new(rows);
+                    builder.append_nulls(rows);
+                    builder.build()
+                } else {
+                    VariantArray::try_new(found.as_ref())?
+                }
             }
             // Row-wise decoding needs objects unshredded.
             None => per_row_get(&unshred_variant(&root)?, path, rows)?,
@@ -249,6 +258,18 @@ impl ScalarUDFImpl for VariantGet {
 ///
 /// Returns the arrow error raised while decoding a row or rendering JSON.
 fn as_text(variant: &VariantArray) -> Result<ArrayRef> {
+    match shredded_text(variant)? {
+        Some(text) => Ok(text),
+        None => decoded_text(variant),
+    }
+}
+
+/// [`as_text`] row by row over the unshredded array.
+///
+/// # Errors
+///
+/// Returns the arrow error raised while decoding a row or rendering JSON.
+fn decoded_text(variant: &VariantArray) -> Result<ArrayRef> {
     let variant = unshred_variant(variant)?;
     let mut text = StringBuilder::with_capacity(variant.len(), 0);
     let mut json = Vec::new();
@@ -270,6 +291,38 @@ fn as_text(variant: &VariantArray) -> Result<ArrayRef> {
         }
     }
     Ok(Arc::new(text.finish()))
+}
+
+/// The text of a Variant whose every value is shredded as a string: its
+/// `typed_value` column, null wherever the row or that column is null.
+///
+/// A string renders as itself, and a row with neither a residual `value` nor
+/// a `typed_value` is a missing path, which renders as SQL null, so the
+/// column already is the answer [`as_text`] would build row by row. `None`
+/// when the array shreds no string or any row keeps a residual `value`,
+/// which then needs row-wise decoding.
+///
+/// # Errors
+///
+/// Returns the arrow error raised while casting the string column to `Utf8`.
+fn shredded_text(variant: &VariantArray) -> Result<Option<ArrayRef>> {
+    let state = variant.shredding_state();
+    let Some(typed) = state.typed_value_column() else {
+        return Ok(None);
+    };
+    let residual = state.value_column();
+    if residual.logical_null_count() != residual.len()
+        || !matches!(
+            typed.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        )
+    {
+        return Ok(None);
+    }
+    let text = cast(typed, &DataType::Utf8)?;
+    let nulls = NullBuffer::union(variant.inner().nulls(), text.nulls());
+    let data = text.to_data().into_builder().nulls(nulls).build()?;
+    Ok(Some(make_array(data)))
 }
 
 /// Resolve a path with at least one non-literal element, row by row: each
@@ -379,5 +432,73 @@ fn object_fields(storage: &DataType) -> Option<Fields> {
     match children.find("typed_value")?.1.data_type() {
         DataType::Struct(fields) => Some(fields.clone()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::StringArray;
+    use parquet_variant_compute::{json_to_variant, shred_variant};
+
+    /// `rows` as JSON objects shredded as `{a: Utf8}`, read at key `a`.
+    fn key_a(rows: Vec<Option<&str>>) -> VariantArray {
+        let json: ArrayRef = Arc::new(StringArray::from(rows));
+        let object = DataType::Struct(vec![Field::new("a", DataType::Utf8, true)].into());
+        let shredded = shred_variant(&json_to_variant(&json).unwrap(), &object).unwrap();
+        let root: ArrayRef = ArrayRef::from(shredded);
+        let options =
+            GetOptions::new_with_path(VariantPath::new(vec![VariantPathElement::field(
+                "a".to_owned(),
+            )]));
+        VariantArray::try_new(variant_get(&root, options).unwrap().as_ref()).unwrap()
+    }
+
+    /// Every value of a shredded string key comes straight from its column,
+    /// with a missing key or null row null, exactly as row-wise rendering.
+    #[test]
+    fn shredded_strings_render_as_row_wise_text() {
+        let found = key_a(vec![
+            Some(r#"{"a":"x"}"#),
+            Some(r#"{"b":1}"#),
+            None,
+            Some(r#"{"a":""}"#),
+        ]);
+        assert!(shredded_text(&found).unwrap().is_some());
+        let text = as_text(&found).unwrap();
+        assert_eq!(text.as_ref(), decoded_text(&found).unwrap().as_ref());
+        let text = text.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(
+            text.iter().collect::<Vec<_>>(),
+            vec![Some("x"), None, None, Some("")]
+        );
+    }
+
+    /// `variant_get` keeps each value's type: an int beside a shredded
+    /// string key comes back as a Variant int, not text.
+    #[test]
+    fn residual_ints_stay_ints() {
+        let found = key_a(vec![Some(r#"{"a":"x"}"#), Some(r#"{"a":7}"#)]);
+        let out = VariantArray::try_new(canonical(&found).unwrap().as_ref()).unwrap();
+        assert_eq!(out.value(0).as_string(), Some("x"));
+        assert_eq!(out.value(1).as_int64(), Some(7));
+    }
+
+    /// A value kept in the residual, a number or a Variant null, needs
+    /// row-wise rendering, which the fast path declines.
+    #[test]
+    fn residual_values_render_row_wise() {
+        let found = key_a(vec![
+            Some(r#"{"a":"x"}"#),
+            Some(r#"{"a":7}"#),
+            Some(r#"{"a":null}"#),
+        ]);
+        assert!(shredded_text(&found).unwrap().is_none());
+        let text = as_text(&found).unwrap();
+        let text = text.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(
+            text.iter().collect::<Vec<_>>(),
+            vec![Some("x"), Some("7"), None]
+        );
     }
 }
