@@ -119,16 +119,16 @@ fn canonical_fields() -> Fields {
     ])
 }
 
-/// Decode a Variant argument of any stored layout, validated.
+/// Decode a Variant argument of any stored layout.
+///
+/// Its bytes are not read here: each arrow-rs kernel validates a value as it
+/// decodes it and returns malformed bytes as an error.
 ///
 /// # Errors
 ///
-/// Returns an error when the argument is not a Variant layout or holds
-/// malformed bytes.
+/// Returns an error when the argument is not a Variant layout.
 fn decode(argument: &ColumnarValue, rows: usize) -> Result<VariantArray> {
-    let variant = VariantArray::try_new(argument.to_array(rows)?.as_ref())?;
-    datafusion_common::variant::validate(&variant)?;
-    Ok(variant)
+    Ok(VariantArray::try_new(argument.to_array(rows)?.as_ref())?)
 }
 
 /// Rebuild a Variant result in the canonical layout, so a function's

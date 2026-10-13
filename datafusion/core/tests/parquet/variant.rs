@@ -331,11 +331,7 @@ async fn malformed_variant_bytes_are_an_error_not_a_panic() -> Result<()> {
         "SELECT v ->> 'k' FROM bad",
         "SELECT v -> 'k' FROM bad",
     ] {
-        let error = ctx.sql(sql).await?.collect().await.unwrap_err();
-        assert!(
-            error.to_string().contains("not a valid Variant"),
-            "{sql}: {error}"
-        );
+        assert_decode_error(ctx.sql(sql).await?.collect().await, sql);
     }
     Ok(())
 }

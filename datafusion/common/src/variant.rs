@@ -24,19 +24,14 @@
 //! [`cast_column_to_field`](crate::nested_struct::cast_column_to_field) sends
 //! a cast whose target field is a Variant here instead.
 //!
-//! Every byte buffer the conversion reads is validated first: arrow-rs
-//! decoding panics on malformed bytes, while a malformed file must be an
-//! error.
+//! arrow-rs validates every value as it decodes it and returns malformed
+//! bytes as an error, so the conversion adds no validation pass of its own.
 
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, ArrayRef, AsArray, BinaryViewArray, GenericListArray, OffsetSizeTrait,
-    StructArray,
-};
-use arrow::compute::{CastOptions, cast};
+use arrow::array::{Array, ArrayRef, StructArray};
+use arrow::compute::CastOptions;
 use arrow::datatypes::{DataType, Field};
-use parquet_variant::{Variant, VariantMetadata};
 use parquet_variant_compute::{VariantArray, unshred_variant};
 
 use crate::error::{_exec_datafusion_err, Result};
@@ -44,9 +39,9 @@ use crate::nested_struct::cast_column;
 
 /// Convert a stored Variant array to the storage type of `target`.
 ///
-/// The source is validated, then unshredded with arrow-rs
-/// [`unshred_variant`], then each child is cast to the target's child type
-/// (for example `BinaryView` to `Binary`).
+/// The source is unshredded with arrow-rs [`unshred_variant`], which
+/// validates each value it decodes, then each child is cast to the target's
+/// child type (for example `BinaryView` to `Binary`).
 ///
 /// # Errors
 ///
@@ -66,7 +61,6 @@ pub fn cast_to_variant_field(
         ));
     };
     let stored = VariantArray::try_new(source.as_ref())?;
-    validate(&stored)?;
     let canonical = unshred_variant(&stored)?.into_inner();
     let children = target_fields
         .iter()
@@ -88,138 +82,11 @@ pub fn cast_to_variant_field(
     )?))
 }
 
-/// Validate every metadata and value buffer `stored` will be decoded from.
-///
-/// Each present row's metadata must parse, and every present residual
-/// `value`, at the top level and under `typed_value`, must be a fully valid
-/// Variant against its row's metadata. arrow-rs full validation bounds its
-/// own recursion depth. Call it before any arrow-rs kernel that decodes
-/// values, since those panic on malformed bytes.
-///
-/// # Errors
-///
-/// Returns an error naming the first row whose metadata or value bytes are
-/// not a valid Variant.
-pub fn validate(stored: &VariantArray) -> Result<()> {
-    let metadata = cast(stored.metadata_column(), &DataType::BinaryView)?;
-    let metadata = metadata.as_binary_view();
-    let owners = (0..stored.len())
-        .map(|row| stored.is_valid(row).then_some(row))
-        .collect::<Vec<_>>();
-    for row in owners.iter().flatten() {
-        VariantMetadata::try_new(metadata.value(*row))?;
-    }
-    let residuals = Residuals { metadata };
-    residuals.validate_values(stored.value_column(), &owners)?;
-    match stored.typed_value_column() {
-        Some(typed) => residuals.validate_typed(typed.as_ref(), &owners),
-        None => Ok(()),
-    }
-}
-
-/// The residual `value` buffers of one Variant column, each decoded with the
-/// metadata of the row that owns it.
-struct Residuals<'a> {
-    /// The column's metadata, one per row.
-    metadata: &'a BinaryViewArray,
-}
-
-impl Residuals<'_> {
-    /// Validate each present `value` against its owner row's metadata.
-    ///
-    /// `owners[i]` is the row that element `i` belongs to, or `None` when it
-    /// is unreachable (a null row, or under a null parent).
-    fn validate_values(&self, value: &ArrayRef, owners: &[Option<usize>]) -> Result<()> {
-        let value = cast(value, &DataType::BinaryView)?;
-        let value = value.as_binary_view();
-        for (element, owner) in owners.iter().enumerate() {
-            if let Some(owner) = *owner
-                && value.is_valid(element)
-            {
-                Variant::try_new(self.metadata.value(owner), value.value(element))
-                    .map_err(|error| {
-                        _exec_datafusion_err!(
-                            "row {owner} is not a valid Variant: {error}"
-                        )
-                    })?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Validate the residuals below one `typed_value`: an object descends
-    /// into each shredded field, an array into its elements, and a primitive
-    /// holds no residual bytes.
-    fn validate_typed(&self, typed: &dyn Array, owners: &[Option<usize>]) -> Result<()> {
-        let owners = present(typed, owners);
-        match typed.data_type() {
-            DataType::Struct(_) => typed
-                .as_struct()
-                .columns()
-                .iter()
-                .try_for_each(|field| self.validate_shredded(field.as_ref(), &owners)),
-            DataType::List(_) => self.validate_elements(typed.as_list::<i32>(), &owners),
-            DataType::LargeList(_) => {
-                self.validate_elements(typed.as_list::<i64>(), &owners)
-            }
-            _ => Ok(()),
-        }
-    }
-
-    /// Validate one shredded node, `Struct<value?, typed_value?>`.
-    fn validate_shredded(
-        &self,
-        node: &dyn Array,
-        owners: &[Option<usize>],
-    ) -> Result<()> {
-        let Some(node) = node.as_struct_opt() else {
-            return Err(_exec_datafusion_err!(
-                "shredded Variant field is {}, not a struct",
-                node.data_type()
-            ));
-        };
-        let owners = present(node, owners);
-        if let Some(value) = node.column_by_name("value") {
-            self.validate_values(value, &owners)?;
-        }
-        match node.column_by_name("typed_value") {
-            Some(typed) => self.validate_typed(typed.as_ref(), &owners),
-            None => Ok(()),
-        }
-    }
-
-    /// Validate a shredded array's elements, each owned by its list's row.
-    fn validate_elements<O: OffsetSizeTrait>(
-        &self,
-        list: &GenericListArray<O>,
-        owners: &[Option<usize>],
-    ) -> Result<()> {
-        let mut elements = vec![None; list.values().len()];
-        let offsets = list.value_offsets();
-        for (row, owner) in owners.iter().enumerate() {
-            if owner.is_some() {
-                elements[offsets[row].as_usize()..offsets[row + 1].as_usize()]
-                    .fill(*owner);
-            }
-        }
-        self.validate_shredded(list.values().as_ref(), &elements)
-    }
-}
-
-/// `owners` with every element `array` holds null cleared.
-fn present(array: &dyn Array, owners: &[Option<usize>]) -> Vec<Option<usize>> {
-    owners
-        .iter()
-        .enumerate()
-        .map(|(element, owner)| owner.filter(|_| array.is_valid(element)))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
-    use arrow::array::{BinaryViewArray, Int64Array, ListArray, StringArray};
+    use arrow::array::{AsArray, BinaryViewArray, Int64Array, ListArray, StringArray};
     use arrow::buffer::{NullBuffer, OffsetBuffer};
     use arrow::datatypes::Fields;
     use parquet_variant_compute::{json_to_variant, shred_variant, variant_to_json};
@@ -372,8 +239,8 @@ mod tests {
         let error = cast(&source, &variant_field("v")).unwrap_err();
 
         assert!(
-            error.to_string().contains("row 0 is not a valid Variant"),
-            "{error}"
+            matches!(error.find_root(), crate::DataFusionError::ArrowError(..)),
+            "{error:?}"
         );
     }
 }

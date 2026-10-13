@@ -52,7 +52,7 @@ recursive_protection = ["dep:recursive"]
 parquet = ["dep:parquet"]
 sql = ["sqlparser"]
 # Reads shredded Parquet Variant columns as the table's Variant.
-variant = ["dep:parquet-variant", "dep:parquet-variant-compute"]
+variant = ["dep:parquet-variant-compute"]
 
 [[bench]]
 harness = false
@@ -86,7 +86,6 @@ log = { workspace = true }
 num-traits = { workspace = true }
 object_store = { workspace = true, optional = true }
 parquet = { workspace = true, optional = true, default-features = true }
-parquet-variant = { workspace = true, optional = true }
 parquet-variant-compute = { workspace = true, optional = true }
 recursive = { workspace = true, optional = true }
 sqlparser = { workspace = true, optional = true }
