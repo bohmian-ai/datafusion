@@ -117,28 +117,27 @@ impl DiskManagerBuilder {
         match self.mode {
             DiskManagerMode::OsTmpDirectory => Ok(DiskManager {
                 local_dirs: Mutex::new(Some(vec![])),
+                conf_dirs: vec![],
                 max_temp_directory_size: AtomicU64::new(self.max_temp_directory_size),
                 max_spill_merge_fan_in: AtomicUsize::new(self.max_spill_merge_fan_in),
                 used_disk_space: Arc::new(AtomicU64::new(0)),
                 active_files_count: Arc::new(AtomicUsize::new(0)),
                 factory: None,
             }),
-            DiskManagerMode::Directories(conf_dirs) => {
-                let local_dirs = create_local_dirs(&conf_dirs)?;
-                debug!(
-                    "Created local dirs {local_dirs:?} as DataFusion working directory"
-                );
-                Ok(DiskManager {
-                    local_dirs: Mutex::new(Some(local_dirs)),
-                    max_temp_directory_size: AtomicU64::new(self.max_temp_directory_size),
-                    max_spill_merge_fan_in: AtomicUsize::new(self.max_spill_merge_fan_in),
-                    used_disk_space: Arc::new(AtomicU64::new(0)),
-                    active_files_count: Arc::new(AtomicUsize::new(0)),
-                    factory: None,
-                })
-            }
+            // The working directories are created on the first spill, so a
+            // query that never spills never touches the filesystem.
+            DiskManagerMode::Directories(conf_dirs) => Ok(DiskManager {
+                local_dirs: Mutex::new(Some(vec![])),
+                conf_dirs,
+                max_temp_directory_size: AtomicU64::new(self.max_temp_directory_size),
+                max_spill_merge_fan_in: AtomicUsize::new(self.max_spill_merge_fan_in),
+                used_disk_space: Arc::new(AtomicU64::new(0)),
+                active_files_count: Arc::new(AtomicUsize::new(0)),
+                factory: None,
+            }),
             DiskManagerMode::Disabled => Ok(DiskManager {
                 local_dirs: Mutex::new(None),
+                conf_dirs: vec![],
                 max_temp_directory_size: AtomicU64::new(self.max_temp_directory_size),
                 max_spill_merge_fan_in: AtomicUsize::new(self.max_spill_merge_fan_in),
                 used_disk_space: Arc::new(AtomicU64::new(0)),
@@ -147,6 +146,7 @@ impl DiskManagerBuilder {
             }),
             DiskManagerMode::Custom(factory) => Ok(DiskManager {
                 local_dirs: Mutex::new(None),
+                conf_dirs: vec![],
                 max_temp_directory_size: AtomicU64::new(self.max_temp_directory_size),
                 max_spill_merge_fan_in: AtomicUsize::new(self.max_spill_merge_fan_in),
                 used_disk_space: Arc::new(AtomicU64::new(0)),
@@ -195,6 +195,10 @@ pub struct DiskManager {
     /// If `Some(vec![])` a new OS specified temporary directory will be created
     /// If `None` an error will be returned (configured not to spill)
     local_dirs: Mutex<Option<Vec<Arc<TempDir>>>>,
+    /// Roots configured by [`DiskManagerMode::Directories`]; the first
+    /// temporary file creates one working directory in each. Empty for
+    /// every other mode.
+    conf_dirs: Vec<PathBuf>,
     /// The maximum amount of data (in bytes) stored inside the temporary directories.
     /// Default to 100GB. Stored as `AtomicU64` so it can be adjusted at runtime
     /// without requiring exclusive (`&mut`) access to the `DiskManager`.
@@ -354,8 +358,14 @@ impl DiskManager {
             )
         })?;
 
-        // Create a temporary directory if needed
-        if local_dirs.is_empty() {
+        // Create the configured working directories, or an OS temporary
+        // directory, on the first spill
+        if local_dirs.is_empty() && !self.conf_dirs.is_empty() {
+            *local_dirs = create_local_dirs(&self.conf_dirs)?;
+            debug!(
+                "Created local dirs {local_dirs:?} as DataFusion working directory for {request_description}"
+            );
+        } else if local_dirs.is_empty() {
             let tempdir = tempfile::tempdir().map_err(DataFusionError::IoError)?;
 
             debug!(
@@ -669,10 +679,20 @@ mod tests {
     #[test]
     fn test_disk_manager_create_spill_folder() {
         let dir = TempDir::new().unwrap();
-        DiskManagerBuilder::default()
-            .with_mode(DiskManagerMode::Directories(vec![dir.path().to_path_buf()]))
-            .build()
-            .unwrap();
+        let dm = Arc::new(
+            DiskManagerBuilder::default()
+                .with_mode(DiskManagerMode::Directories(vec![dir.path().to_path_buf()]))
+                .build()
+                .unwrap(),
+        );
+        assert!(dm.temp_dir_paths().is_empty(), "no spill, no directory");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        let file = dm.create_tmp_file("Testing").unwrap();
+        let paths = dm.temp_dir_paths();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].starts_with(dir.path()));
+        assert_path_in_dirs(file.path().unwrap(), [dir.path()].into_iter());
     }
 
     /// Asserts that `file_path` is found anywhere in any of `dir` directories
