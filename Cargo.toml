@@ -188,9 +188,9 @@ parquet = { version = "60.0.0", default-features = false, features = [
     "async",
     "object_store",
 ] }
-parquet-variant = "60.0.0"
-parquet-variant-compute = "60.0.0"
-parquet-variant-json = "60.0.0"
+parquet-variant = { package = "bohmian-parquet-variant", version = "60.0.0" }
+parquet-variant-compute = { package = "bohmian-parquet-variant-compute", version = "60.0.0" }
+parquet-variant-json = { package = "bohmian-parquet-variant-json", version = "60.0.0" }
 pbjson = { version = "0.9.0" }
 pbjson-types = "0.9"
 percent-encoding = "2.3"
@@ -415,24 +415,24 @@ incremental = false
 # arrow-rs 60.0.0 with the unshred_variant pre-size, exact JSON integer and
 # fallible Variant decoding fixes.
 [patch.crates-io]
-arrow = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "864ed411f90c28037dba045ccd38720cf8494010" }
-arrow-arith = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "864ed411f90c28037dba045ccd38720cf8494010" }
-arrow-array = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "864ed411f90c28037dba045ccd38720cf8494010" }
-arrow-avro = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "864ed411f90c28037dba045ccd38720cf8494010" }
-arrow-buffer = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "864ed411f90c28037dba045ccd38720cf8494010" }
-arrow-cast = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "864ed411f90c28037dba045ccd38720cf8494010" }
-arrow-cmp = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "864ed411f90c28037dba045ccd38720cf8494010" }
-arrow-csv = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "864ed411f90c28037dba045ccd38720cf8494010" }
-arrow-data = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "864ed411f90c28037dba045ccd38720cf8494010" }
-arrow-flight = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "864ed411f90c28037dba045ccd38720cf8494010" }
-arrow-ipc = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "864ed411f90c28037dba045ccd38720cf8494010" }
-arrow-json = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "864ed411f90c28037dba045ccd38720cf8494010" }
-arrow-ord = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "864ed411f90c28037dba045ccd38720cf8494010" }
-arrow-row = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "864ed411f90c28037dba045ccd38720cf8494010" }
-arrow-schema = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "864ed411f90c28037dba045ccd38720cf8494010" }
-arrow-select = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "864ed411f90c28037dba045ccd38720cf8494010" }
-arrow-string = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "864ed411f90c28037dba045ccd38720cf8494010" }
-parquet = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "864ed411f90c28037dba045ccd38720cf8494010" }
-parquet-variant = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "864ed411f90c28037dba045ccd38720cf8494010" }
-parquet-variant-compute = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "864ed411f90c28037dba045ccd38720cf8494010" }
-parquet-variant-json = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "864ed411f90c28037dba045ccd38720cf8494010" }
+arrow = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054" }
+arrow-arith = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054" }
+arrow-array = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054" }
+arrow-avro = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054" }
+arrow-buffer = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054" }
+arrow-cast = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054" }
+arrow-cmp = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054" }
+arrow-csv = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054" }
+arrow-data = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054" }
+arrow-flight = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054" }
+arrow-ipc = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054" }
+arrow-json = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054" }
+arrow-ord = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054" }
+arrow-row = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054" }
+arrow-schema = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054" }
+arrow-select = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054" }
+arrow-string = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054" }
+parquet = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054" }
+bohmian-parquet-variant = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054" }
+bohmian-parquet-variant-compute = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054" }
+bohmian-parquet-variant-json = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054" }
