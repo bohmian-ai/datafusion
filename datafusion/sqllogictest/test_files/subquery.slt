@@ -2515,6 +2515,38 @@ SELECT x FROM sq_main WHERE x = (SELECT v FROM sq_empty UNION ALL SELECT 20);
 ----
 20
 
+# Inputs whose row bound cannot be proven are still checked: two unmatched
+# singleton FULL JOIN inputs give two rows, and one row under
+# GROUPING SETS ((x), ()) gives two equal groups.
+query error DataFusion error: Execution error: Scalar subquery returned more than one row
+SELECT x, (SELECT COALESCE(l.v, r.v) FROM (VALUES (1)) l(v) FULL JOIN (VALUES (2)) r(v) ON l.v = r.v) FROM sq_main;
+
+query error DataFusion error: Execution error: Scalar subquery returned more than one row
+SELECT x FROM sq_main WHERE x > (SELECT COALESCE(l.v, r.v) FROM (VALUES (1)) l(v) FULL JOIN (VALUES (2)) r(v) ON l.v = r.v);
+
+query error DataFusion error: Execution error: Scalar subquery returned more than one row
+SELECT x, (SELECT COUNT(*) FROM (VALUES (1)) t(v) GROUP BY GROUPING SETS ((v), ())) FROM sq_main;
+
+query error DataFusion error: Execution error: Scalar subquery returned more than one row
+SELECT x FROM sq_main WHERE x > (SELECT COUNT(*) FROM (VALUES (1)) t(v) GROUP BY GROUPING SETS ((v), ()));
+
+# A proven singleton is not wrapped.
+query TT
+EXPLAIN SELECT x FROM sq_main WHERE x = (SELECT max(v) FROM sq_values);
+----
+logical_plan
+01)Projection: sq_main.x
+02)--Inner Join: sq_main.x = __scalar_sq_1.max(sq_values.v)
+03)----TableScan: sq_main projection=[x]
+04)----SubqueryAlias: __scalar_sq_1
+05)------Aggregate: groupBy=[[]], aggr=[[max(sq_values.v)]]
+06)--------TableScan: sq_values projection=[v]
+physical_plan
+01)HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(max(sq_values.v)@0, x@0)], projection=[x@1]
+02)--AggregateExec: mode=Single, gby=[], aggr=[max(sq_values.v)]
+03)----DataSourceExec: partitions=1, partition_sizes=[1]
+04)--DataSourceExec: partitions=1, partition_sizes=[1]
+
 # A single non-aggregated row keeps its type.
 query IT
 SELECT (SELECT v FROM sq_values WHERE v = 2), arrow_typeof((SELECT v FROM sq_values WHERE v = 2));

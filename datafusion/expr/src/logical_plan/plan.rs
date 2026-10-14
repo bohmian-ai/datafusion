@@ -1443,6 +1443,10 @@ impl LogicalPlan {
     ///
     /// If `None`, the plan can return any number of rows.
     /// If `Some(n)` then the plan can return at most `n` rows but may return fewer.
+    ///
+    /// `Some(n)` is a guarantee that callers use to skip runtime checks, such as
+    /// a scalar subquery's one-row check, so an operator whose output can exceed
+    /// a derived bound, or whose bound does not fit in `usize`, returns `None`.
     pub fn max_rows(self: &LogicalPlan) -> Option<usize> {
         match self {
             LogicalPlan::Projection(Projection { input, .. }) => input.max_rows(),
@@ -1463,6 +1467,9 @@ impl LogicalPlan {
                     .all(|expr| matches!(expr, Expr::Literal(_, _)))
                 {
                     Some(1)
+                } else if contains_grouping_set(group_expr) {
+                    // Each grouping set groups every input row again.
+                    None
                 } else {
                     input.max_rows()
                 }
@@ -1483,13 +1490,16 @@ impl LogicalPlan {
                 join_type,
                 ..
             }) => match join_type {
-                JoinType::Inner => Some(left.max_rows()? * right.max_rows()?),
+                JoinType::Inner => left.max_rows()?.checked_mul(right.max_rows()?),
                 JoinType::Left | JoinType::Right | JoinType::Full => {
                     match (left.max_rows()?, right.max_rows()?, join_type) {
                         (0, 0, _) => Some(0),
                         (max_rows, 0, JoinType::Left | JoinType::Full) => Some(max_rows),
                         (0, max_rows, JoinType::Right | JoinType::Full) => Some(max_rows),
-                        (left_max, right_max, _) => Some(left_max * right_max),
+                        // Unmatched rows of both sides are null-extended, so the
+                        // output can exceed the product.
+                        (_, _, JoinType::Full) => None,
+                        (left_max, right_max, _) => left_max.checked_mul(right_max),
                     }
                 }
                 JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark => {
@@ -1501,12 +1511,9 @@ impl LogicalPlan {
             },
             LogicalPlan::AsOfJoin(AsOfJoin { left, .. }) => left.max_rows(),
             LogicalPlan::Repartition(Repartition { input, .. }) => input.max_rows(),
-            LogicalPlan::Union(Union { inputs, .. }) => {
-                inputs.iter().try_fold(0usize, |mut acc, plan| {
-                    acc += plan.max_rows()?;
-                    Some(acc)
-                })
-            }
+            LogicalPlan::Union(Union { inputs, .. }) => inputs
+                .iter()
+                .try_fold(0usize, |acc, plan| acc.checked_add(plan.max_rows()?)),
             LogicalPlan::TableScan(TableScan { fetch, .. }) => *fetch,
             LogicalPlan::EmptyRelation(EmptyRelation {
                 produce_one_row, ..
@@ -6236,6 +6243,81 @@ mod tests {
                 .build()?;
             assert_eq!(join.min_rows(), expected_min_rows, "{join_type} join");
         }
+
+        Ok(())
+    }
+
+    /// `max_rows` is a proof, so a plan that can emit more rows than a
+    /// derived bound, or a bound that cannot be represented, must be unknown.
+    #[test]
+    fn max_rows_is_a_sound_upper_bound() -> Result<()> {
+        let one_row = |alias: &str| {
+            LogicalPlanBuilder::values(vec![vec![lit(1)]])?
+                .alias(alias)?
+                .build()
+        };
+        let no_rows = LogicalPlanBuilder::from(one_row("r")?)
+            .limit(0, Some(0))?
+            .build()?;
+        let join = |right: LogicalPlan, join_type| {
+            LogicalPlanBuilder::from(one_row("l")?)
+                .join_on(right, join_type, [col("l.column1").eq(col("r.column1"))])?
+                .build()
+        };
+        let projected = |plan: LogicalPlan| {
+            LogicalPlanBuilder::from(plan)
+                .project(vec![lit(1).alias("x")])?
+                .alias("s")?
+                .build()
+        };
+
+        // Two unmatched singleton inputs yield two null-extended rows.
+        let full = join(one_row("r")?, JoinType::Full)?;
+        assert_eq!(full.max_rows(), None);
+        assert_eq!(projected(full)?.max_rows(), None);
+        assert_eq!(join(no_rows.clone(), JoinType::Full)?.max_rows(), Some(1));
+        assert_eq!(join(one_row("r")?, JoinType::Left)?.max_rows(), Some(1));
+        assert_eq!(join(no_rows, JoinType::Inner)?.max_rows(), Some(0));
+
+        // `GROUPING SETS ((x), ())` yields two groups from one input row.
+        let grouping_sets = LogicalPlanBuilder::from(one_row("t")?)
+            .aggregate(
+                vec![Expr::GroupingSet(GroupingSet::GroupingSets(vec![
+                    vec![col("column1")],
+                    vec![],
+                ]))],
+                vec![count(lit(1))],
+            )?
+            .build()?;
+        assert_eq!(grouping_sets.max_rows(), None);
+        assert_eq!(projected(grouping_sets)?.max_rows(), None);
+        let global = LogicalPlanBuilder::from(one_row("t")?)
+            .aggregate(Vec::<Expr>::new(), vec![count(lit(1))])?
+            .build()?;
+        assert_eq!(projected(global)?.max_rows(), Some(1));
+        let limited = LogicalPlanBuilder::from(table_scan(
+            Some("employee"),
+            &employee_schema(),
+            None,
+        )?)
+        .limit(0, Some(1))?
+        .build()?;
+        assert_eq!(limited.max_rows(), Some(1));
+
+        // Bounds that overflow `usize` are unknown, not wrapped or panicking.
+        let mut huge = table_scan(Some("l"), &employee_schema(), None)?.build()?;
+        let LogicalPlan::TableScan(scan) = &mut huge else {
+            unreachable!("table_scan builds a TableScan")
+        };
+        scan.fetch = Some(usize::MAX);
+        let cross_join = LogicalPlanBuilder::from(huge.clone())
+            .cross_join(LogicalPlanBuilder::from(huge.clone()).alias("r")?.build()?)?
+            .build()?;
+        assert_eq!(cross_join.max_rows(), None);
+        let union = LogicalPlanBuilder::from(huge.clone())
+            .union(huge)?
+            .build()?;
+        assert_eq!(union.max_rows(), None);
 
         Ok(())
     }
