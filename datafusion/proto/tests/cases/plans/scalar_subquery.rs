@@ -276,3 +276,37 @@ async fn roundtrip_scalar_subquery_exec_with_default_converter_executes() -> Res
 
     Ok(())
 }
+
+/// A scalar subquery joined under the flag-off path keeps its row-count
+/// check through a proto round-trip: the decoded plan still merges every
+/// partition's partial `single_value` state and refuses two duplicate rows.
+#[tokio::test]
+async fn roundtrip_joined_scalar_subquery_refuses_two_rows() -> Result<()> {
+    let ctx = SessionContext::new();
+    ctx.sql(
+        "SET datafusion.optimizer.enable_physical_uncorrelated_scalar_subquery = false",
+    )
+    .await?
+    .collect()
+    .await?;
+    let plan = ctx
+        .sql("SELECT x FROM (VALUES (10), (20)) t(x) WHERE x = (SELECT 10 UNION ALL SELECT 10)")
+        .await?
+        .create_physical_plan()
+        .await?;
+    let decoded = super::roundtrip_test_and_return(
+        plan,
+        &ctx,
+        &DefaultPhysicalExtensionCodec {},
+        &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {},
+    )?;
+    let err = datafusion::physical_plan::collect(decoded, ctx.task_ctx())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Scalar subquery returned more than one row"),
+        "{err}"
+    );
+    Ok(())
+}

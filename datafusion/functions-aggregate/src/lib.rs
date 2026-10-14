@@ -85,6 +85,7 @@ pub mod min_max;
 pub mod nth_value;
 pub mod percentile_cont;
 pub mod regr;
+pub mod single_value;
 pub mod stddev;
 pub mod string_agg;
 pub mod sum;
@@ -138,6 +139,7 @@ pub mod expr_fn {
     pub use super::regr::regr_sxx;
     pub use super::regr::regr_sxy;
     pub use super::regr::regr_syy;
+    pub use super::single_value::single_value;
     pub use super::stddev::stddev;
     pub use super::stddev::stddev_pop;
     pub use super::sum::sum;
@@ -188,6 +190,7 @@ pub fn all_default_aggregate_functions() -> Vec<Arc<AggregateUDF>> {
         average::avg_udaf(),
         grouping::grouping_udaf(),
         nth_value::nth_value_udaf(),
+        single_value::single_value_udaf(),
     ]
 }
 

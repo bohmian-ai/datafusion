@@ -98,6 +98,7 @@ SELECT SUM(x) WITHIN GROUP (ORDER BY x) FROM t;
 - [min](#min)
 - [percentile_cont](#percentile_cont)
 - [quantile_cont](#quantile_cont)
+- [single_value](#single_value)
 - [string_agg](#string_agg)
 - [sum](#sum)
 - [var](#var)
@@ -486,6 +487,29 @@ An alternate syntax is also supported:
 ### `quantile_cont`
 
 _Alias of [percentile_cont](#percentile_cont)._
+
+### `single_value`
+
+Returns the value of the only row in a group, or NULL if the group has no rows. Fails if the group has more than one row, even when the rows are equal or NULL. This gives a scalar subquery its row-count semantics when it is planned as a join.
+
+```sql
+single_value(expression)
+```
+
+#### Arguments
+
+- **expression**: The expression to operate on. Can be a constant, column, or function, and any combination of operators.
+
+#### Example
+
+```sql
+> SELECT single_value(column_name) FROM table_name WHERE id = 1;
++---------------------------+
+| single_value(column_name) |
++---------------------------+
+| only_value                |
++---------------------------+
+```
 
 ### `string_agg`
 

@@ -34,7 +34,9 @@ use datafusion_common::{Column, Result, ScalarValue, assert_or_internal_err, pla
 use datafusion_expr::expr_rewriter::create_col_from_scalar_expr;
 use datafusion_expr::logical_plan::{JoinType, Subquery};
 use datafusion_expr::utils::conjunction;
-use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, lit, not, when};
+use datafusion_expr::{
+    AggregateUDF, Expr, LogicalPlan, LogicalPlanBuilder, lit, not, when,
+};
 
 /// Optimizer rule that rewrites scalar subquery filters to joins and places an
 /// additional projection on top of the filter to preserve the original schema.
@@ -119,11 +121,12 @@ impl OptimizerRule for ScalarSubqueryToJoin {
                     "Expected subqueries not found in filter"
                 );
 
+                let single_value = single_value_udaf(config);
                 // iterate through all subqueries in predicate, turning each into a left join
                 let mut cur_input = filter.input.as_ref().clone();
                 for (subquery, alias) in subqueries {
                     if let Some((optimized_subquery, compensation_exprs)) =
-                        build_join(&subquery, &cur_input, &alias)?
+                        build_join(&subquery, &cur_input, &alias, single_value.as_ref())?
                     {
                         if !compensation_exprs.is_empty() {
                             rewrite_expr = rewrite_expr
@@ -188,11 +191,12 @@ impl OptimizerRule for ScalarSubqueryToJoin {
                     !all_subqueries.is_empty(),
                     "Expected subqueries not found in projection"
                 );
+                let single_value = single_value_udaf(config);
                 // iterate through all subqueries in predicate, turning each into a left join
                 let mut cur_input = projection.input.as_ref().clone();
                 for (subquery, alias) in all_subqueries {
                     if let Some((optimized_subquery, compensation_exprs)) =
-                        build_join(&subquery, &cur_input, &alias)?
+                        build_join(&subquery, &cur_input, &alias, single_value.as_ref())?
                     {
                         cur_input = optimized_subquery;
                         if !compensation_exprs.is_empty()
@@ -246,6 +250,14 @@ impl OptimizerRule for ScalarSubqueryToJoin {
     fn apply_order(&self) -> Option<ApplyOrder> {
         Some(ApplyOrder::TopDown)
     }
+}
+
+/// Returns the registered `single_value` aggregate, which an uncorrelated
+/// scalar subquery that may return several rows needs before it is joined.
+fn single_value_udaf(config: &dyn OptimizerConfig) -> Option<Arc<AggregateUDF>> {
+    config
+        .function_registry()
+        .and_then(|registry| registry.udaf("single_value").ok())
 }
 
 /// Returns true if the expression contains a scalar subquery that this rule
@@ -336,8 +348,13 @@ impl TreeNodeRewriter for ExtractScalarSubQuery<'_> {
 /// * `subquery_alias` - The unique alias assigned to the decorrelated
 ///   subquery; used both to qualify the join condition and to produce
 ///   column references for the caller to substitute.
+/// * `single_value` - The `single_value` aggregate, which gives an
+///   uncorrelated subquery that may return several rows its scalar row-count
+///   semantics: its value, NULL for no rows, or an error for more than one.
 ///
-/// Returns `Ok(None)` if the subquery cannot be decorrelated. On success,
+/// Returns `Ok(None)` if the subquery cannot be decorrelated, or if it is an
+/// uncorrelated subquery that may return several rows and `single_value` is
+/// not registered. On success,
 /// returns the rewritten outer plan and a map from each count-bug-affected
 /// column to its `CASE WHEN __always_true IS NULL THEN ... END` compensation
 /// expression, which the caller must substitute into any expression that
@@ -346,6 +363,7 @@ fn build_join(
     subquery: &Subquery,
     outer_input: &LogicalPlan,
     subquery_alias: &str,
+    single_value: Option<&Arc<AggregateUDF>>,
 ) -> Result<Option<(LogicalPlan, HashMap<Column, Expr>)>> {
     // `build_join` also handles uncorrelated scalar subqueries (as a left
     // join with `Boolean(true)`) when the
@@ -361,6 +379,27 @@ fn build_join(
         .collected_count_expr_map
         .get(&decorrelated_subquery)
         .cloned();
+    // Joined as a set, extra rows of an uncorrelated scalar subquery would
+    // match or multiply outer rows instead of failing the query.
+    let decorrelated_subquery = if subquery.outer_ref_columns.is_empty()
+        && decorrelated_subquery.max_rows().is_none_or(|rows| rows > 1)
+    {
+        let Some(single_value) = single_value else {
+            return Ok(None);
+        };
+        let (qualifier, field) = decorrelated_subquery.schema().qualified_field(0);
+        let value = single_value
+            .call(vec![Expr::Column(Column::new(
+                qualifier.cloned(),
+                field.name(),
+            ))])
+            .alias(field.name());
+        LogicalPlanBuilder::from(decorrelated_subquery)
+            .aggregate(Vec::<Expr>::new(), vec![value])?
+            .build()?
+    } else {
+        decorrelated_subquery
+    };
     let aliased_subquery = LogicalPlanBuilder::from(decorrelated_subquery)
         .alias(subquery_alias.to_string())?
         .build()?;
@@ -1243,6 +1282,39 @@ mod tests {
         "
         );
 
+        Ok(())
+    }
+
+    /// Without a registered `single_value`, an uncorrelated scalar subquery
+    /// that may return several rows is left unrewritten rather than joined
+    /// as a set.
+    #[test]
+    fn multi_row_uncorrelated_scalar_subquery_needs_single_value() -> Result<()> {
+        use datafusion_common::config::ConfigOptions;
+
+        let sq = Arc::new(
+            LogicalPlanBuilder::from(scan_tpch_table("orders"))
+                .project(vec![col("orders.o_custkey")])?
+                .build()?,
+        );
+        let plan = LogicalPlanBuilder::from(scan_tpch_table("customer"))
+            .filter(col("customer.c_custkey").eq(scalar_subquery(sq)))?
+            .build()?;
+
+        let mut options = ConfigOptions::default();
+        options
+            .optimizer
+            .enable_physical_uncorrelated_scalar_subquery = false;
+        let context = crate::OptimizerContext::new_with_config_options(Arc::new(options));
+        let rule: Arc<dyn OptimizerRule + Send + Sync> =
+            Arc::new(ScalarSubqueryToJoin::new());
+        let optimized_plan = crate::Optimizer::with_rules(vec![rule]).optimize(
+            plan.clone(),
+            &context,
+            |_, _| {},
+        )?;
+
+        assert_eq!(optimized_plan, plan);
         Ok(())
     }
 }

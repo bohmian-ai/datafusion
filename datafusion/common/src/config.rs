@@ -1631,9 +1631,11 @@ config_namespace! {
         ///
         /// Note disabling this option is not recommended. It restores
         /// pre <https://github.com/apache/datafusion/pull/21240>
-        /// behavior, which silently produces incorrect results for
-        /// multi-row subqueries and does not support scalar subqueries in
-        /// ORDER BY / JOIN ON / aggregate-function arguments. This option is
+        /// behavior, which does not support scalar subqueries in
+        /// ORDER BY / JOIN ON / aggregate-function arguments. A rewritten
+        /// subquery that may return several rows is wrapped in the
+        /// `single_value` aggregate, which refuses more than one row when
+        /// that aggregate is registered. This option is
         /// intended as a temporary escape hatch for distributed execution
         /// frameworks and is planned to be removed in a future DataFusion
         /// release.
