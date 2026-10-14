@@ -6295,13 +6295,9 @@ mod tests {
             .aggregate(Vec::<Expr>::new(), vec![count(lit(1))])?
             .build()?;
         assert_eq!(projected(global)?.max_rows(), Some(1));
-        let limited = LogicalPlanBuilder::from(table_scan(
-            Some("employee"),
-            &employee_schema(),
-            None,
-        )?)
-        .limit(0, Some(1))?
-        .build()?;
+        let limited = table_scan(Some("employee"), &employee_schema(), None)?
+            .limit(0, Some(1))?
+            .build()?;
         assert_eq!(limited.max_rows(), Some(1));
 
         // Bounds that overflow `usize` are unknown, not wrapped or panicking.
