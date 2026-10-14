@@ -30,6 +30,8 @@ use datafusion_expr_common::columnar_value::ColumnarValue;
 use datafusion_expr_common::sort_properties::{ExprProperties, SortProperties};
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 
+use crate::expressions::Literal;
+
 /// A physical expression whose value is provided by a scalar subquery.
 ///
 /// Subquery execution is handled by `ScalarSubqueryExec`, which stores the
@@ -162,6 +164,22 @@ impl PhysicalExpr for ScalarSubqueryExpr {
 
     fn fmt_sql(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "(scalar subquery)")
+    }
+
+    /// Replaces this runtime-bound expression with a static [`Literal`]
+    /// carrying the populated subquery value and the output field metadata,
+    /// so callers can serialize or rewrite it without the shared results
+    /// container. Snapshotting before `ScalarSubqueryExec` has populated the
+    /// slot is an error, since no static value exists yet.
+    fn snapshot(&self) -> Result<Option<Arc<dyn PhysicalExpr>>> {
+        let value = self.results.get(self.index).ok_or_else(|| {
+            internal_datafusion_err!(
+                "ScalarSubqueryExpr snapshotted before the subquery was executed"
+            )
+        })?;
+        let metadata = FieldMetadata::from(self.field.as_ref());
+        let metadata = (!metadata.is_empty()).then_some(metadata);
+        Ok(Some(Arc::new(Literal::new_with_metadata(value, metadata))))
     }
 
     #[cfg(feature = "proto")]
@@ -340,6 +358,103 @@ mod tests {
             other_results,
         );
         assert_ne!(e1a, e3);
+    }
+
+    #[test]
+    fn snapshot_of_ready_value_is_literal_with_metadata() -> Result<()> {
+        let metadata = FieldMetadata::from(std::collections::HashMap::from([(
+            "ARROW:extension:name".to_string(),
+            "example.extension".to_string(),
+        )]));
+        let results = make_results(vec![Some(ScalarValue::Utf8(Some("x".into())))]);
+        let expr = ScalarSubqueryExpr::new_with_metadata(
+            DataType::Utf8,
+            true,
+            Some(metadata),
+            SubqueryIndex::new(0),
+            results,
+        );
+
+        let snapshot = expr.snapshot()?.expect("ready subquery snapshots");
+        let literal = snapshot
+            .downcast_ref::<Literal>()
+            .expect("snapshot is a Literal");
+        assert_eq!(literal.value(), &ScalarValue::Utf8(Some("x".into())));
+        let field = snapshot.return_field(&Schema::empty())?;
+        assert_eq!(
+            field.metadata().get("ARROW:extension:name"),
+            Some(&"example.extension".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_of_typed_null_keeps_type() -> Result<()> {
+        let results = make_results(vec![Some(ScalarValue::Int64(None))]);
+        let expr = ScalarSubqueryExpr::new(
+            DataType::Int64,
+            true,
+            SubqueryIndex::new(0),
+            results,
+        );
+
+        let snapshot = expr.snapshot()?.expect("ready subquery snapshots");
+        let literal = snapshot
+            .downcast_ref::<Literal>()
+            .expect("snapshot is a Literal");
+        assert_eq!(literal.value(), &ScalarValue::Int64(None));
+        assert_eq!(snapshot.data_type(&Schema::empty())?, DataType::Int64);
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_before_populated_is_error() {
+        let expr = ScalarSubqueryExpr::new(
+            DataType::Int32,
+            false,
+            SubqueryIndex::new(0),
+            ScalarSubqueryResults::new(1),
+        );
+        assert!(expr.snapshot().is_err());
+    }
+
+    #[test]
+    fn recursive_snapshot_replaces_nested_subquery_per_execution() -> Result<()> {
+        use crate::expressions::{BinaryExpr, col};
+        use datafusion_expr_common::operator::Operator;
+        use datafusion_physical_expr_common::physical_expr::snapshot_physical_expr;
+
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+        let results = ScalarSubqueryResults::new(1);
+        let subquery: Arc<dyn PhysicalExpr> = Arc::new(ScalarSubqueryExpr::new(
+            DataType::Int32,
+            true,
+            SubqueryIndex::new(0),
+            results.clone(),
+        ));
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(BinaryExpr::new(col("a", &schema)?, Operator::Eq, subquery)),
+            Operator::And,
+            Arc::new(BinaryExpr::new(
+                col("a", &schema)?,
+                Operator::Gt,
+                Arc::new(Literal::new(ScalarValue::Int32(Some(0)))),
+            )),
+        ));
+
+        results.set(SubqueryIndex::new(0), ScalarValue::Int32(Some(7)))?;
+        let first = snapshot_physical_expr(Arc::clone(&predicate))?;
+        assert_eq!(first.to_string(), "a@0 = 7 AND a@0 > 0");
+
+        // A reset followed by re-execution must snapshot the new value; the
+        // reusable predicate retains the runtime-bound expression.
+        results.clear();
+        assert!(snapshot_physical_expr(Arc::clone(&predicate)).is_err());
+        results.set(SubqueryIndex::new(0), ScalarValue::Int32(Some(9)))?;
+        let second = snapshot_physical_expr(predicate)?;
+        assert_eq!(second.to_string(), "a@0 = 9 AND a@0 > 0");
+        assert_eq!(first.to_string(), "a@0 = 7 AND a@0 > 0");
+        Ok(())
     }
 
     #[test]
