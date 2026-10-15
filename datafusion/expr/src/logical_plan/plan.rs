@@ -31,7 +31,7 @@ use super::invariants::{
 };
 use crate::builder::{unique_field_aliases, unnest_with_options};
 use crate::expr::{
-    Alias, Cast, Placeholder, ScalarFunction, Sort as SortExpr, TryCast, WindowFunction,
+    Alias, Placeholder, ScalarFunction, Sort as SortExpr, WindowFunction,
     WindowFunctionParams, intersect_metadata_for_union,
 };
 use crate::expr_rewriter::{
@@ -2964,24 +2964,47 @@ impl Filter {
 /// so a unique-key equality against it selects at most one row.
 ///
 /// Literals, bound parameters and outer references are fixed for one filter
-/// invocation; operators, casts and non-volatile scalar functions are fixed
-/// when all their operands are. Anything else, including input columns,
-/// volatile functions, session variables and nested plans, is not proven fixed.
+/// invocation. Ordinary pure expressions over them (operators, casts,
+/// non-volatile scalar functions, CASE, BETWEEN, IN lists, LIKE and SIMILAR
+/// TO, null and truth tests) are fixed when every child is, including CASE
+/// conditions and branches that may go unused. Anything else, including input
+/// columns, volatile functions, session variables, nested plans, aggregates,
+/// windows, lambdas and any variant not listed here, is not proven fixed.
 fn is_fixed_value(expr: &Expr) -> bool {
     match expr {
         Expr::Literal(..) | Expr::Placeholder(_) | Expr::OuterReferenceColumn(..) => true,
-        Expr::Alias(Alias { expr, .. })
-        | Expr::Cast(Cast { expr, .. })
-        | Expr::TryCast(TryCast { expr, .. })
-        | Expr::Negative(expr)
-        | Expr::Not(expr) => is_fixed_value(expr),
-        Expr::BinaryExpr(BinaryExpr { left, right, .. }) => {
-            is_fixed_value(left) && is_fixed_value(right)
+        Expr::ScalarFunction(ScalarFunction { func, .. })
+            if func.signature().volatility == Volatility::Volatile =>
+        {
+            false
         }
-        Expr::ScalarFunction(ScalarFunction { func, args }) => {
-            func.signature().volatility != Volatility::Volatile
-                && args.iter().all(is_fixed_value)
-        }
+        Expr::Alias(_)
+        | Expr::Cast(_)
+        | Expr::TryCast(_)
+        | Expr::Negative(_)
+        | Expr::Not(_)
+        | Expr::BinaryExpr(_)
+        | Expr::ScalarFunction(_)
+        | Expr::Case(_)
+        | Expr::Between(_)
+        | Expr::InList(_)
+        | Expr::Like(_)
+        | Expr::SimilarTo(_)
+        | Expr::IsNull(_)
+        | Expr::IsNotNull(_)
+        | Expr::IsTrue(_)
+        | Expr::IsFalse(_)
+        | Expr::IsUnknown(_)
+        | Expr::IsNotTrue(_)
+        | Expr::IsNotFalse(_)
+        | Expr::IsNotUnknown(_) => matches!(
+            expr.apply_children(|child| Ok(if is_fixed_value(child) {
+                TreeNodeRecursion::Continue
+            } else {
+                TreeNodeRecursion::Stop
+            })),
+            Ok(TreeNodeRecursion::Continue)
+        ),
         _ => false,
     }
 }
@@ -5319,8 +5342,8 @@ mod tests {
     use crate::select_expr::SelectExpr;
     use crate::test::function_stub::{count, count_udaf};
     use crate::{
-        ColumnarValue, GroupingSet, binary_expr, cast, col, exists, in_subquery, lit,
-        out_ref_col, placeholder, scalar_subquery,
+        ColumnarValue, GroupingSet, Like, binary_expr, case, cast, col, exists,
+        in_subquery, lit, out_ref_col, placeholder, scalar_subquery, when,
     };
     use datafusion_common::metadata::ScalarAndMetadata;
     use datafusion_common::tree_node::{
@@ -6617,6 +6640,63 @@ mod tests {
                 fixed,
                 "{value} = a"
             );
+        }
+
+        // Pure compound expressions are fixed only when every child is,
+        // including CASE conditions, bases and branches that may go unused.
+        // Each shape places the probe in one child slot; the rest are fixed.
+        let like = |similar: bool, expr: Expr, pattern: Expr| {
+            let like = Like::new(false, Box::new(expr), Box::new(pattern), None, false);
+            if similar {
+                Expr::SimilarTo(like)
+            } else {
+                Expr::Like(like)
+            }
+        };
+        let shapes: Vec<Box<dyn Fn(Expr) -> Result<Expr>>> = vec![
+            Box::new(|p| when(p.gt(lit(0i64)), outer()).otherwise(lit(0i64))),
+            Box::new(|p| when(outer().gt(lit(0i64)), p).otherwise(lit(0i64))),
+            Box::new(|p| when(outer().gt(lit(0i64)), lit(0i64)).otherwise(p)),
+            Box::new(|p| when(outer().gt(lit(0i64)), p).end()),
+            Box::new(|p| case(p).when(lit(1i64), outer()).otherwise(lit(0i64))),
+            Box::new(|p| case(outer()).when(p, lit(1i64)).end()),
+            Box::new(|p| Ok(p.between(outer(), lit(9i64)))),
+            Box::new(|p| Ok(outer().between(p, lit(9i64)))),
+            Box::new(|p| Ok(outer().between(lit(0i64), p))),
+            Box::new(|p| Ok(p.in_list(vec![outer(), lit(1i64)], false))),
+            Box::new(|p| Ok(outer().in_list(vec![lit(1i64), p], true))),
+            Box::new(|p| Ok(like(false, p, outer()))),
+            Box::new(|p| Ok(like(false, outer(), p))),
+            Box::new(|p| Ok(like(true, p, outer()))),
+            Box::new(|p| Ok(like(true, outer(), p))),
+            Box::new(|p| Ok(p.is_null())),
+            Box::new(|p| Ok(p.is_not_null())),
+            Box::new(|p| Ok(p.is_true())),
+            Box::new(|p| Ok(p.is_false())),
+            Box::new(|p| Ok(p.is_unknown())),
+            Box::new(|p| Ok(p.is_not_true())),
+            Box::new(|p| Ok(p.is_not_false())),
+            Box::new(|p| Ok(p.is_not_unknown())),
+        ];
+        for shape in &shapes {
+            for (probe, fixed) in [
+                (outer(), true),
+                (lit(1i64), true),
+                (col("b"), false),
+                (call(Volatility::Volatile, lit(1i64)), false),
+            ] {
+                let value = shape(probe)?;
+                assert_eq!(
+                    is_scalar(&key_a, col("a").eq(value.clone()))?,
+                    fixed,
+                    "a = {value}"
+                );
+                assert_eq!(
+                    is_scalar(&key_a, value.clone().eq(col("a")))?,
+                    fixed,
+                    "{value} = a"
+                );
+            }
         }
 
         // A composite key needs every key column fixed.

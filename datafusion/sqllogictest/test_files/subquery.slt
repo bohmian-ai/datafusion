@@ -445,6 +445,39 @@ SELECT t1_id, (SELECT t3_int FROM t3 WHERE t3.t3_id = t1.t1_id) as t3_int from t
 33 NULL
 44 3
 
+# A unique key compared to a pure expression of outer values is still one row
+# per outer row, for a declared primary key and for a grouped key.
+query II rowsort
+SELECT t1_id, (SELECT t3_int FROM t3 WHERE t3.t3_id = CASE WHEN t1.t1_id > 0 THEN t1.t1_id ELSE -t1.t1_id END) as t3_int from t1
+----
+11 3
+22 1
+33 NULL
+44 3
+
+query II rowsort
+SELECT t1_id, (SELECT g.t3_id FROM (SELECT t3_id, COUNT(*) n FROM t3 GROUP BY t3_id) g WHERE g.t3_id = CASE WHEN t1.t1_id > 0 THEN t1.t1_id ELSE -t1.t1_id END) as t3_id from t1
+----
+11 11
+22 22
+33 NULL
+44 44
+
+query II rowsort
+SELECT t1_id, (SELECT t3_int FROM t3 WHERE t3.t3_id = CASE WHEN t1.t1_id BETWEEN 0 AND 100 AND t1.t1_id IN (11, 22, 33, 44) AND CAST(t1.t1_id AS VARCHAR) LIKE '%' AND CAST(t1.t1_id AS VARCHAR) SIMILAR TO '[0-9]+' AND t1.t1_id IS NOT NULL AND (t1.t1_id > 0) IS TRUE THEN t1.t1_id END) as t3_int from t1
+----
+11 3
+22 1
+33 NULL
+44 3
+
+# A row-dependent or volatile part anywhere in the value is not a proof.
+statement error DataFusion error: Invalid \(non-executable\) plan after Analyzer\ncaused by\nError during planning: Correlated scalar subquery must be aggregated to return at most one row
+SELECT t1_id, (SELECT g.t3_id FROM (SELECT t3_id, COUNT(*) n FROM t3 GROUP BY t3_id) g WHERE g.t3_id = CASE WHEN g.n > 0 THEN t1.t1_id END) as t3_id from t1
+
+statement error DataFusion error: Invalid \(non-executable\) plan after Analyzer\ncaused by\nError during planning: Correlated scalar subquery must be aggregated to return at most one row
+SELECT t1_id, (SELECT t3_int FROM t3 WHERE t3.t3_id = CASE WHEN random() >= 0 THEN t1.t1_id END) as t3_int from t1
+
 
 #non_aggregated_correlated_scalar_subquery
 statement error DataFusion error: Invalid \(non-executable\) plan after Analyzer\ncaused by\nError during planning: Correlated scalar subquery must be aggregated to return at most one row
@@ -2545,6 +2578,9 @@ SELECT x FROM sq_main WHERE x > (SELECT k FROM (SELECT k, COUNT(*) n FROM (VALUE
 
 query error DataFusion error: Execution error: Scalar subquery returned more than one row
 SELECT single_value(k) FROM (SELECT k, COUNT(*) n FROM (VALUES (1), (2), (2)) t(k) GROUP BY k) g WHERE k = abs(n);
+
+query error DataFusion error: Execution error: Scalar subquery returned more than one row
+SELECT x, (SELECT k FROM (SELECT k, COUNT(*) n FROM (VALUES (1), (2), (2)) t(k) GROUP BY k) g WHERE k = CASE WHEN n > 0 THEN n END) FROM sq_main;
 
 # A key compared to a fixed value is still a singleton.
 query I
