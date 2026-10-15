@@ -31,8 +31,8 @@ use super::invariants::{
 };
 use crate::builder::{unique_field_aliases, unnest_with_options};
 use crate::expr::{
-    Alias, Placeholder, Sort as SortExpr, WindowFunction, WindowFunctionParams,
-    intersect_metadata_for_union,
+    Alias, Cast, Placeholder, ScalarFunction, Sort as SortExpr, TryCast, WindowFunction,
+    WindowFunctionParams, intersect_metadata_for_union,
 };
 use crate::expr_rewriter::{
     NamePreserver, create_col_from_scalar_expr, normalize_cols, normalize_sorts,
@@ -49,8 +49,8 @@ use crate::utils::{
 use crate::{
     BinaryExpr, CreateMemoryTable, CreateView, Execute, Expr, ExprSchemable, GroupingSet,
     LogicalPlanBuilder, Operator, Prepare, TableProviderFilterPushDown, TableSource,
-    WindowFunctionDefinition, build_asof_join_schema, build_join_schema, expr_vec_fmt,
-    requalify_sides_if_needed,
+    Volatility, WindowFunctionDefinition, build_asof_join_schema, build_join_schema,
+    expr_vec_fmt, requalify_sides_if_needed,
 };
 
 use crate::statistics::StatisticsRequest;
@@ -2939,8 +2939,9 @@ impl Filter {
                 }
 
                 match (left.as_ref(), right.as_ref()) {
-                    (Expr::Column(_), Expr::Column(_)) => None,
-                    (Expr::Column(c), _) | (_, Expr::Column(c)) => {
+                    (Expr::Column(c), value) | (value, Expr::Column(c))
+                        if is_fixed_value(value) =>
+                    {
                         Some(schema.index_of_column(c).unwrap())
                     }
                     _ => None,
@@ -2956,6 +2957,32 @@ impl Filter {
             }
         }
         false
+    }
+}
+
+/// Returns true when `expr` has one value for every row of a filter's input,
+/// so a unique-key equality against it selects at most one row.
+///
+/// Literals, bound parameters and outer references are fixed for one filter
+/// invocation; operators, casts and non-volatile scalar functions are fixed
+/// when all their operands are. Anything else, including input columns,
+/// volatile functions, session variables and nested plans, is not proven fixed.
+fn is_fixed_value(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(..) | Expr::Placeholder(_) | Expr::OuterReferenceColumn(..) => true,
+        Expr::Alias(Alias { expr, .. })
+        | Expr::Cast(Cast { expr, .. })
+        | Expr::TryCast(TryCast { expr, .. })
+        | Expr::Negative(expr)
+        | Expr::Not(expr) => is_fixed_value(expr),
+        Expr::BinaryExpr(BinaryExpr { left, right, .. }) => {
+            is_fixed_value(left) && is_fixed_value(right)
+        }
+        Expr::ScalarFunction(ScalarFunction { func, args }) => {
+            func.signature().volatility != Volatility::Volatile
+                && args.iter().all(is_fixed_value)
+        }
+        _ => false,
     }
 }
 
@@ -5292,8 +5319,8 @@ mod tests {
     use crate::select_expr::SelectExpr;
     use crate::test::function_stub::{count, count_udaf};
     use crate::{
-        GroupingSet, binary_expr, col, exists, in_subquery, lit, placeholder,
-        scalar_subquery,
+        ColumnarValue, GroupingSet, binary_expr, cast, col, exists, in_subquery, lit,
+        out_ref_col, placeholder, scalar_subquery,
     };
     use datafusion_common::metadata::ScalarAndMetadata;
     use datafusion_common::tree_node::{
@@ -6525,6 +6552,111 @@ mod tests {
         let filter =
             Filter::try_new(Expr::Column(col.into()).eq(lit(1i32)), scan).unwrap();
         assert!(filter.is_scalar());
+    }
+
+    /// A unique-key equality proves one row only when the compared value is
+    /// fixed for the whole filter, never when it varies with the input row.
+    #[test]
+    fn filter_is_scalar_only_for_fixed_key_values() -> Result<()> {
+        let keyed = |nullable: bool, key: Vec<usize>| -> Result<Arc<LogicalPlan>> {
+            let schema = Schema::new(
+                ["a", "b", "c"]
+                    .map(|name| Field::new(name, DataType::Int64, nullable))
+                    .to_vec(),
+            );
+            let source = LogicalTableSource::new(Arc::new(schema)).with_constraints(
+                Constraints::new_unverified(vec![Constraint::Unique(key)]),
+            );
+            Ok(Arc::new(
+                LogicalPlanBuilder::scan("t", Arc::new(source), None)?.build()?,
+            ))
+        };
+        let is_scalar = |input: &Arc<LogicalPlan>, predicate: Expr| -> Result<bool> {
+            Ok(Filter::try_new(predicate, Arc::clone(input))?.is_scalar())
+        };
+        let udf = |volatility| {
+            Arc::new(crate::create_udf(
+                "f",
+                vec![DataType::Int64],
+                DataType::Int64,
+                volatility,
+                Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+            ))
+        };
+        let call = |volatility, arg: Expr| udf(volatility).call(vec![arg]);
+        let outer = || out_ref_col(DataType::Int64, "o.x");
+
+        let key_a = keyed(false, vec![0])?;
+        for (value, fixed) in [
+            (lit(1i64), true),
+            (placeholder("$1"), true),
+            (outer(), true),
+            (outer() + lit(1i64), true),
+            (cast(outer(), DataType::Int64), true),
+            (call(Volatility::Immutable, outer()), true),
+            (call(Volatility::Stable, lit(1i64)), true),
+            (col("b") + lit(0i64), false),
+            (cast(col("b"), DataType::Int64), false),
+            (call(Volatility::Immutable, col("b")), false),
+            (call(Volatility::Volatile, lit(1i64)), false),
+            (
+                Expr::ScalarVariable(
+                    Arc::new(Field::new("@v", DataType::Int64, true)),
+                    vec!["@v".into()],
+                ),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                is_scalar(&key_a, col("a").eq(value.clone()))?,
+                fixed,
+                "a = {value}"
+            );
+            assert_eq!(
+                is_scalar(&key_a, value.clone().eq(col("a")))?,
+                fixed,
+                "{value} = a"
+            );
+        }
+
+        // A composite key needs every key column fixed.
+        let key_ab = keyed(false, vec![0, 1])?;
+        assert!(is_scalar(
+            &key_ab,
+            col("a").eq(lit(1i64)).and(col("b").eq(lit(2i64)))
+        )?);
+        assert!(!is_scalar(&key_ab, col("a").eq(lit(1i64)))?);
+        assert!(!is_scalar(
+            &key_ab,
+            col("a").eq(lit(1i64)).and(col("b").eq(col("c")))
+        )?);
+        assert!(!is_scalar(
+            &key_ab,
+            col("a")
+                .eq(lit(1i64))
+                .and(col("b").eq(col("c") * lit(2i64)))
+        )?);
+
+        // A nullable UNIQUE key admits several NULL rows.
+        assert!(!is_scalar(&keyed(true, vec![0])?, col("a").eq(lit(1i64)))?);
+
+        // Two surviving groups of a grouped count keep their input bound.
+        let grouped = LogicalPlanBuilder::values(vec![
+            vec![lit(1i64)],
+            vec![lit(2i64)],
+            vec![lit(2i64)],
+        ])?
+        .aggregate(vec![col("column1")], vec![count(lit(1)).alias("n")])?
+        .build()?;
+        let filtered = |value: Expr| {
+            LogicalPlanBuilder::from(grouped.clone())
+                .filter(col("column1").eq(value))?
+                .build()
+        };
+        assert_eq!(filtered(col("n") + lit(0i64))?.max_rows(), Some(3));
+        assert_eq!(filtered(lit(2i64))?.max_rows(), Some(1));
+
+        Ok(())
     }
 
     #[test]

@@ -2359,6 +2359,11 @@ SELECT (SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) AS t ORDER BY v LIMIT 1
 ----
 1
 
+# Reference for the flag-off cases below: a key equality against a value
+# that varies by row is not a singleton proof, so (1, 1) and (2, 2) are two rows.
+query error DataFusion error: Execution error: Scalar subquery returned more than one row
+SELECT (SELECT k FROM (SELECT k, COUNT(*) n FROM (VALUES (1), (2), (2)) t(k) GROUP BY k) g WHERE k = abs(n)) FROM sq_main;
+
 #############
 ## End-to-end correctness coverage for the flag-off path.
 ## When `datafusion.optimizer.enable_physical_uncorrelated_scalar_subquery` is false,
@@ -2529,6 +2534,23 @@ SELECT x, (SELECT COUNT(*) FROM (VALUES (1)) t(v) GROUP BY GROUPING SETS ((v), (
 
 query error DataFusion error: Execution error: Scalar subquery returned more than one row
 SELECT x FROM sq_main WHERE x > (SELECT COUNT(*) FROM (VALUES (1)) t(v) GROUP BY GROUPING SETS ((v), ()));
+
+# A unique key compared to a row-dependent value is not a singleton proof:
+# the grouped counts keep (1, 1) and (2, 2).
+query error DataFusion error: Execution error: Scalar subquery returned more than one row
+SELECT x, (SELECT k FROM (SELECT k, COUNT(*) n FROM (VALUES (1), (2), (2)) t(k) GROUP BY k) g WHERE k = abs(n)) FROM sq_main;
+
+query error DataFusion error: Execution error: Scalar subquery returned more than one row
+SELECT x FROM sq_main WHERE x > (SELECT k FROM (SELECT k, COUNT(*) n FROM (VALUES (1), (2), (2)) t(k) GROUP BY k) g WHERE k = abs(n));
+
+query error DataFusion error: Execution error: Scalar subquery returned more than one row
+SELECT single_value(k) FROM (SELECT k, COUNT(*) n FROM (VALUES (1), (2), (2)) t(k) GROUP BY k) g WHERE k = abs(n);
+
+# A key compared to a fixed value is still a singleton.
+query I
+SELECT (SELECT k FROM (SELECT k, COUNT(*) n FROM (VALUES (1), (2), (2)) t(k) GROUP BY k) g WHERE k = abs(-2));
+----
+2
 
 # A proven singleton is not wrapped.
 query TT
