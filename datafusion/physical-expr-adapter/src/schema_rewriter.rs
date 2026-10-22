@@ -282,6 +282,9 @@ impl PhysicalExprAdapter for DefaultPhysicalExprAdapter {
     }
 }
 
+/// Arrow field-metadata key under which Parquet and Iceberg carry a field id.
+const PARQUET_FIELD_ID_META_KEY: &str = "PARQUET:field_id";
+
 struct DefaultPhysicalExprAdapterRewriter {
     logical_file_schema: SchemaRef,
     physical_file_schema: SchemaRef,
@@ -992,15 +995,39 @@ impl DefaultPhysicalExprAdapterRewriter {
         // resolving by name ensures we match the correct physical slot. Once we know the
         // proper index we rebuild the `Column` with `new_with_schema` so callers can rely
         // on `column.index()` later without having to re-query the schema.
-        let Ok(physical_column_index) = self.physical_file_schema.index_of(column.name())
-        else {
+        //
+        // A file whose fields carry `PARQUET:field_id` is resolved by that id
+        // instead, as Iceberg requires: a renamed column keeps its id, and a
+        // column the file predates has no field with it. The column then
+        // names the file's own field, so later planning against the physical
+        // schema sees a consistent expression.
+        let logical_id = self
+            .logical_file_schema
+            .field_with_name(column.name())
+            .ok()
+            .and_then(|field| field.metadata().get(PARQUET_FIELD_ID_META_KEY));
+        let physical_ids = self
+            .physical_file_schema
+            .fields()
+            .iter()
+            .any(|field| field.metadata().contains_key(PARQUET_FIELD_ID_META_KEY));
+        let physical_column_index = match logical_id.filter(|_| physical_ids) {
+            Some(id) => self.physical_file_schema.fields().iter().position(|field| {
+                field.metadata().get(PARQUET_FIELD_ID_META_KEY) == Some(id)
+            }),
+            None => self.physical_file_schema.index_of(column.name()).ok(),
+        };
+        let Some(physical_column_index) = physical_column_index else {
             return Ok(None);
         };
 
-        let column = if column.index() == physical_column_index {
+        let physical_name = self.physical_file_schema.field(physical_column_index).name();
+        let column = if column.index() == physical_column_index
+            && column.name() == physical_name
+        {
             column.clone()
         } else {
-            Column::new_with_schema(column.name(), self.physical_file_schema.as_ref())?
+            Column::new(physical_name, physical_column_index)
         };
 
         let physical_field = Arc::new(
@@ -1405,6 +1432,43 @@ mod tests {
             panic!("Expected literal expression");
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_rewrite_column_resolves_by_field_id() -> Result<()> {
+        let id = |name: &str, id: &str| {
+            Field::new(name, DataType::Int32, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                id.to_string(),
+            )]))
+        };
+        let physical_schema = Schema::new(vec![id("old", "1"), id("reused", "2")]);
+        let logical_schema = Schema::new(vec![
+            id("renamed", "1"),
+            id("reused", "3"),
+            id("added", "4"),
+        ]);
+        let adapter = DefaultPhysicalExprAdapterFactory
+            .create(Arc::new(logical_schema), Arc::new(physical_schema))?;
+
+        let renamed = adapter.rewrite(Arc::new(Column::new("renamed", 0)))?;
+        let cast = renamed
+            .downcast_ref::<CastExpr>()
+            .expect("a renamed column is cast to its logical field");
+        let column = cast
+            .expr()
+            .downcast_ref::<Column>()
+            .expect("the cast reads the physical column");
+        assert_eq!((column.name(), column.index()), ("old", 0));
+
+        for (name, index) in [("reused", 1), ("added", 2)] {
+            let result = adapter.rewrite(Arc::new(Column::new(name, index)))?;
+            let literal = result
+                .downcast_ref::<Literal>()
+                .expect("a field id the file lacks reads null");
+            assert_eq!(*literal.value(), ScalarValue::Int32(None));
+        }
         Ok(())
     }
 
