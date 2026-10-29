@@ -394,6 +394,10 @@ impl PrunableStatistics {
         get_stat: impl Fn(&ColumnStatistics) -> &Precision<ScalarValue>,
     ) -> Option<ArrayRef> {
         let index = self.schema.index_of(column.name()).ok()?;
+        // A container without an exact value is a null of the column's own
+        // type, so it can share one array with the containers that have one.
+        let unknown = ScalarValue::try_from(self.schema.field(index).data_type())
+            .unwrap_or(ScalarValue::Null);
         let mut has_value = false;
         match ScalarValue::iter_to_array(self.statistics.iter().map(|s| {
             s.column_statistics
@@ -406,7 +410,7 @@ impl PrunableStatistics {
                         None
                     }
                 })
-                .unwrap_or(ScalarValue::Null)
+                .unwrap_or_else(|| unknown.clone())
         })) {
             // If there is any non-null value and no errors, return the array
             Ok(array) => has_value.then_some(array),
@@ -625,6 +629,48 @@ mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field};
     use std::sync::Arc;
+
+    #[test]
+    fn mixed_timestamp_bounds_preserve_unknown_containers() {
+        let data_type = DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Nanosecond,
+            Some("+00:00".into()),
+        );
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("t", data_type.clone(), false)]));
+        let bounded = |min: i64, max: i64| {
+            let mut statistics = Statistics::new_unknown(&schema);
+            statistics.column_statistics[0].min_value = Precision::Exact(
+                ScalarValue::TimestampNanosecond(Some(min), Some("+00:00".into())),
+            );
+            statistics.column_statistics[0].max_value = Precision::Exact(
+                ScalarValue::TimestampNanosecond(Some(max), Some("+00:00".into())),
+            );
+            Arc::new(statistics)
+        };
+        let statistics = PrunableStatistics::new(
+            vec![
+                bounded(1, 2),
+                Arc::new(Statistics::new_unknown(&schema)),
+                Arc::new(bounded(5, 6).as_ref().clone().to_inexact()),
+                bounded(10, 20),
+            ],
+            Arc::clone(&schema),
+        );
+        for values in [
+            statistics.min_values(&Column::from_name("t")),
+            statistics.max_values(&Column::from_name("t")),
+        ] {
+            let values = values.expect("exact bounds convert beside unknown containers");
+            assert_eq!(values.data_type(), &data_type);
+            assert_eq!(
+                (0..values.len())
+                    .map(|i| values.is_valid(i))
+                    .collect::<Vec<_>>(),
+                [true, false, false, true]
+            );
+        }
+    }
 
     /// return a PartitionPruningStatistics for two columns 'a' and 'b'
     /// and the following stats
