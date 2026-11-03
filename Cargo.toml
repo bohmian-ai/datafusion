@@ -144,8 +144,8 @@ datafusion-functions = { path = "datafusion/functions", version = "55.1.0" }
 datafusion-functions-aggregate = { path = "datafusion/functions-aggregate", version = "55.1.0" }
 datafusion-functions-aggregate-common = { path = "datafusion/functions-aggregate-common", version = "55.1.0" }
 datafusion-functions-nested = { path = "datafusion/functions-nested", version = "55.1.0", default-features = false }
-datafusion-functions-variant = { path = "datafusion/functions-variant", version = "55.1.0", default-features = false }
 datafusion-functions-table = { path = "datafusion/functions-table", version = "55.1.0" }
+datafusion-functions-variant = { path = "datafusion/functions-variant", version = "55.1.0", default-features = false }
 datafusion-functions-window = { path = "datafusion/functions-window", version = "55.1.0" }
 datafusion-functions-window-common = { path = "datafusion/functions-window-common", version = "55.1.0" }
 datafusion-macros = { path = "datafusion/macros", version = "55.1.0" }
