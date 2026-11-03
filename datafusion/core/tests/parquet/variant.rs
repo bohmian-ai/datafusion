@@ -803,7 +803,7 @@ async fn invalid_stored_variants_are_errors() -> Result<()> {
                 );
             }
             for sql in [
-                "SELECT variant_get(v, 'k') FROM t",
+                "SELECT variant_get(v, 0) FROM t",
                 "SELECT to_json(v) FROM t",
             ] {
                 assert_decode_error(

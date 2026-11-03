@@ -41,8 +41,8 @@
 //!   `variant_get` and `v ->> k` as `variant_get_text`.
 //!
 //! Every function reads any stored Variant layout, shredded or not, and
-//! returns the canonical unshredded layout. Malformed bytes are an error,
-//! never a panic.
+//! returns the canonical unshredded layout. Malformed bytes a function reads
+//! are an error, never a panic; `variant_get` reads only its path.
 //!
 //! [DataFusion]: https://crates.io/crates/datafusion
 
