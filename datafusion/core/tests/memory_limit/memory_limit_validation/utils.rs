@@ -43,10 +43,6 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = T>,
 {
-    // Initialize system information
-    let mut system = System::new_all();
-    system.refresh_all();
-
     // Get the current process ID
     let pid = sysinfo::get_current_pid().expect("Failed to get current PID");
 
@@ -58,7 +54,9 @@ where
 
     // Spawn a monitoring task
     let monitor_handle = SpawnedTask::spawn(async move {
-        let mut sys = System::new_all();
+        // Refreshing only this process keeps the first sample inside the
+        // measured query; a full host scan can outlast it.
+        let mut sys = System::new();
         let mut interval = interval(Duration::from_millis(7));
 
         loop {
