@@ -2616,6 +2616,9 @@ mod tests {
     use std::ops::{Not, Rem};
 
     use super::*;
+    use datafusion_common::Statistics;
+    use datafusion_common::pruning::PrunableStatistics;
+    use datafusion_common::stats::Precision;
     use datafusion_common::test_util::batches_to_string;
     use datafusion_expr::{and, col, lit, or};
     use datafusion_physical_expr::utils::collect_columns;
@@ -2638,6 +2641,96 @@ mod tests {
     };
     use datafusion_physical_expr::planner::logical2physical;
     use itertools::Itertools;
+
+    thread_local! {
+        static WARNINGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Records this thread's warnings, so a test sees only the warnings its own
+    /// synchronous calls emit.
+    struct WarningCapture;
+
+    impl log::Log for WarningCapture {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.level() <= log::Level::Warn
+        }
+
+        fn log(&self, record: &log::Record) {
+            if self.enabled(record.metadata()) {
+                WARNINGS.with(|w| w.borrow_mut().push(record.args().to_string()));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// Runs `f` and returns the warnings it logged on this thread.
+    fn warnings_of<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            log::set_logger(&WarningCapture).expect("no other test logger");
+            log::set_max_level(log::LevelFilter::Warn);
+        });
+        WARNINGS.with(|w| w.borrow_mut().clear());
+        let value = f();
+        (value, WARNINGS.with(|w| w.take()))
+    }
+
+    #[test]
+    fn empty_containers_prune_without_warnings() {
+        let utc = Some("+00:00".into());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "start_time_unix_nano",
+                DataType::Timestamp(TimeUnit::Nanosecond, utc.clone()),
+                false,
+            ),
+            Field::new("service_name", DataType::Utf8, false),
+            Field::new("kind", DataType::Int32, false),
+            Field::new("gen_ai_operation_name", DataType::Utf8, true),
+        ]));
+        let time =
+            |nanos| lit(ScalarValue::TimestampNanosecond(Some(nanos), utc.clone()));
+        let expr = col("start_time_unix_nano")
+            .gt_eq(time(100))
+            .and(col("start_time_unix_nano").lt(time(200)))
+            .and(col("service_name").eq(lit("checkout")))
+            .and(col("kind").eq(lit(2)))
+            .and(col("gen_ai_operation_name").eq(lit("chat")));
+        let predicate = PruningPredicateBuilder::new()
+            .with_file_schema(Arc::clone(&schema))
+            .try_build(logical2physical(&expr, &schema))
+            .unwrap();
+        let bounded = |min, max| {
+            let mut statistics = Statistics::new_unknown(&schema);
+            statistics.column_statistics[0].min_value = Precision::Exact(
+                ScalarValue::TimestampNanosecond(Some(min), utc.clone()),
+            );
+            statistics.column_statistics[0].max_value = Precision::Exact(
+                ScalarValue::TimestampNanosecond(Some(max), utc.clone()),
+            );
+            Arc::new(statistics)
+        };
+
+        let empty = PrunableStatistics::new(vec![], Arc::clone(&schema));
+        let (kept, warnings) = warnings_of(|| predicate.prune(&empty));
+        assert_eq!(kept.unwrap(), Vec::<bool>::new());
+        assert_eq!(warnings, Vec::<String>::new());
+
+        // An exact container before the window is excluded; the unknown one
+        // and the one inside the window stay eligible.
+        let mixed = PrunableStatistics::new(
+            vec![
+                bounded(10, 20),
+                Arc::new(Statistics::new_unknown(&schema)),
+                bounded(150, 160),
+            ],
+            Arc::clone(&schema),
+        );
+        let (kept, warnings) = warnings_of(|| predicate.prune(&mixed));
+        assert_eq!(kept.unwrap(), [false, true, true]);
+        assert_eq!(warnings, Vec::<String>::new());
+    }
 
     #[derive(Debug, Default)]
     /// Mock statistic provider for tests

@@ -388,50 +388,87 @@ impl PrunableStatistics {
         Self { statistics, schema }
     }
 
+    /// Returns one array of the exact `bound` of `column` across the
+    /// containers, or `None` when there is nothing to prune with.
+    ///
+    /// A failed conversion of genuinely incompatible statistics is logged and
+    /// treated as unavailable, so pruning stays conservative.
     fn get_exact_column_statistics(
         &self,
         column: &Column,
+        bound: &str,
         get_stat: impl Fn(&ColumnStatistics) -> &Precision<ScalarValue>,
     ) -> Option<ArrayRef> {
-        let index = self.schema.index_of(column.name()).ok()?;
-        // A container without an exact value is a null of the column's own
-        // type, so it can share one array with the containers that have one.
-        let unknown = ScalarValue::try_from(self.schema.field(index).data_type())
-            .unwrap_or(ScalarValue::Null);
-        let mut has_value = false;
-        match ScalarValue::iter_to_array(self.statistics.iter().map(|s| {
-            s.column_statistics
-                .get(index)
-                .and_then(|stat| {
-                    if let Precision::Exact(min) = get_stat(stat) {
-                        has_value = true;
-                        Some(min.clone())
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_else(|| unknown.clone())
-        })) {
-            // If there is any non-null value and no errors, return the array
-            Ok(array) => has_value.then_some(array),
-            Err(_) => {
-                log::warn!(
-                    "Failed to convert min values to array for column {}",
-                    column.name()
-                );
+        self.exact_column_statistics(column, bound, get_stat)
+            .unwrap_or_else(|diagnostic| {
+                log::warn!("{diagnostic}");
                 None
-            }
+            })
+    }
+
+    /// Combines the exact `bound` of `column` across the containers into one
+    /// array of the column's type, aligned with the containers.
+    ///
+    /// A container without an exact value is a null of the column's own type,
+    /// so exact values survive beside absent, inexact, and missing entries.
+    /// Without any exact value, including when there are no containers, the
+    /// statistics are unavailable and no conversion is attempted.
+    ///
+    /// The error is a diagnostic naming the bound, the column, and the
+    /// mismatched types. It never contains a statistics value, since the
+    /// conversion error embeds one.
+    fn exact_column_statistics(
+        &self,
+        column: &Column,
+        bound: &str,
+        get_stat: impl Fn(&ColumnStatistics) -> &Precision<ScalarValue>,
+    ) -> Result<Option<ArrayRef>, String> {
+        let Ok(index) = self.schema.index_of(column.name()) else {
+            return Ok(None);
+        };
+        let exact = || {
+            self.statistics.iter().map(|statistics| {
+                match statistics.column_statistics.get(index).map(&get_stat) {
+                    Some(Precision::Exact(value)) => Some(value),
+                    _ => None,
+                }
+            })
+        };
+        if exact().all(|value| value.is_none()) {
+            return Ok(None);
         }
+        let data_type = self.schema.field(index).data_type();
+        let unknown = ScalarValue::try_from(data_type).unwrap_or(ScalarValue::Null);
+        ScalarValue::iter_to_array(
+            exact().map(|value| value.cloned().unwrap_or_else(|| unknown.clone())),
+        )
+        .map(Some)
+        .map_err(|_| {
+            let reason = exact()
+                .flatten()
+                .map(ScalarValue::data_type)
+                .find(|found| found != data_type)
+                .map_or_else(
+                    || format!("column type {data_type} has no typed unknown value"),
+                    |found| {
+                        format!("statistics of type {found} do not match column type {data_type}")
+                    },
+                );
+            format!(
+                "Failed to convert {bound} values to array for column {}: {reason}",
+                column.name()
+            )
+        })
     }
 }
 
 impl PruningStatistics for PrunableStatistics {
     fn min_values(&self, column: &Column) -> Option<ArrayRef> {
-        self.get_exact_column_statistics(column, |stat| &stat.min_value)
+        self.get_exact_column_statistics(column, "min", |stat| &stat.min_value)
     }
 
     fn max_values(&self, column: &Column) -> Option<ArrayRef> {
-        self.get_exact_column_statistics(column, |stat| &stat.max_value)
+        self.get_exact_column_statistics(column, "max", |stat| &stat.max_value)
     }
 
     fn num_containers(&self) -> usize {
@@ -630,45 +667,227 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use std::sync::Arc;
 
+    /// One container whose single column has the given exact bounds.
+    fn exact_bounds(
+        schema: &SchemaRef,
+        min: ScalarValue,
+        max: ScalarValue,
+    ) -> Arc<Statistics> {
+        let mut statistics = Statistics::new_unknown(schema);
+        statistics.column_statistics[0].min_value = Precision::Exact(min);
+        statistics.column_statistics[0].max_value = Precision::Exact(max);
+        Arc::new(statistics)
+    }
+
+    /// The three kinds of container that carry no exact bound: absent,
+    /// inexact, and one with no entry for the column at all.
+    fn unknown_bounds(
+        schema: &SchemaRef,
+        min: ScalarValue,
+        max: ScalarValue,
+    ) -> [Arc<Statistics>; 3] {
+        let inexact = exact_bounds(schema, min, max).as_ref().clone().to_inexact();
+        [
+            Arc::new(Statistics::new_unknown(schema)),
+            Arc::new(inexact),
+            Arc::new(Statistics::new_unknown(&Schema::empty())),
+        ]
+    }
+
+    fn single_column(data_type: &DataType) -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("c", data_type.clone(), true)]))
+    }
+
+    fn bounds_of(statistics: &PrunableStatistics) -> [Option<ArrayRef>; 2] {
+        let column = Column::from_name("c");
+        [
+            statistics.min_values(&column),
+            statistics.max_values(&column),
+        ]
+    }
+
     #[test]
-    fn mixed_timestamp_bounds_preserve_unknown_containers() {
-        let data_type = DataType::Timestamp(
-            arrow::datatypes::TimeUnit::Nanosecond,
-            Some("+00:00".into()),
+    fn partial_statistics_preserve_exact_bounds() {
+        let tz = Some("+00:00".into());
+        let cases = [
+            (
+                DataType::Int32,
+                ScalarValue::Int32(Some(1)),
+                ScalarValue::Int32(Some(9)),
+            ),
+            (
+                DataType::Int64,
+                ScalarValue::Int64(Some(-5)),
+                ScalarValue::Int64(Some(5)),
+            ),
+            (
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, tz.clone()),
+                ScalarValue::TimestampNanosecond(Some(1), tz.clone()),
+                ScalarValue::TimestampNanosecond(Some(2), tz),
+            ),
+            (
+                DataType::Utf8,
+                ScalarValue::from("a"),
+                ScalarValue::from("m"),
+            ),
+            (
+                DataType::Utf8View,
+                ScalarValue::Utf8View(Some("a".into())),
+                ScalarValue::Utf8View(Some("m".into())),
+            ),
+            (
+                DataType::LargeUtf8,
+                ScalarValue::LargeUtf8(Some("a".into())),
+                ScalarValue::LargeUtf8(Some("m".into())),
+            ),
+            (
+                DataType::Decimal128(20, 4),
+                ScalarValue::Decimal128(Some(12345), 20, 4),
+                ScalarValue::Decimal128(Some(67890), 20, 4),
+            ),
+        ];
+        for (data_type, min, max) in cases {
+            let schema = single_column(&data_type);
+            let exact = exact_bounds(&schema, min.clone(), max.clone());
+            let [absent, inexact, missing] =
+                unknown_bounds(&schema, min.clone(), max.clone());
+            // Exact first and unknown first, so the order that fixes the
+            // array type never matters.
+            for containers in [
+                vec![
+                    Arc::clone(&exact),
+                    Arc::clone(&absent),
+                    Arc::clone(&inexact),
+                    Arc::clone(&missing),
+                    Arc::clone(&exact),
+                ],
+                vec![
+                    Arc::clone(&missing),
+                    Arc::clone(&inexact),
+                    Arc::clone(&exact),
+                    Arc::clone(&absent),
+                ],
+            ] {
+                let known = containers
+                    .iter()
+                    .map(|c| Arc::ptr_eq(c, &exact))
+                    .collect::<Vec<_>>();
+                let statistics = PrunableStatistics::new(containers, Arc::clone(&schema));
+                for (values, expected) in
+                    bounds_of(&statistics).into_iter().zip([&min, &max])
+                {
+                    let values = values.unwrap_or_else(|| {
+                        panic!(
+                            "exact {data_type} bounds convert beside unknown containers"
+                        )
+                    });
+                    assert_eq!(values.data_type(), &data_type);
+                    assert_eq!(values.len(), known.len());
+                    for (i, known) in known.iter().enumerate() {
+                        assert_eq!(
+                            values.is_valid(i),
+                            *known,
+                            "{data_type} container {i}"
+                        );
+                        if *known {
+                            assert_eq!(
+                                &ScalarValue::try_from_array(&values, i).unwrap(),
+                                expected
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_statistics_do_not_warn() {
+        let schema = single_column(&DataType::Int64);
+        let column = Column::from_name("c");
+        let [absent, inexact, missing] = unknown_bounds(
+            &schema,
+            ScalarValue::Int64(Some(1)),
+            ScalarValue::Int64(Some(2)),
         );
-        let schema =
-            Arc::new(Schema::new(vec![Field::new("t", data_type.clone(), false)]));
-        let bounded = |min: i64, max: i64| {
-            let mut statistics = Statistics::new_unknown(&schema);
-            statistics.column_statistics[0].min_value = Precision::Exact(
-                ScalarValue::TimestampNanosecond(Some(min), Some("+00:00".into())),
-            );
-            statistics.column_statistics[0].max_value = Precision::Exact(
-                ScalarValue::TimestampNanosecond(Some(max), Some("+00:00".into())),
-            );
-            Arc::new(statistics)
+        let quiet = |statistics: &PrunableStatistics, column: &Column| {
+            [
+                statistics.exact_column_statistics(column, "min", |s| &s.min_value),
+                statistics.exact_column_statistics(column, "max", |s| &s.max_value),
+            ]
         };
+        // `get_exact_column_statistics` warns only for an `Err`, so `Ok(None)`
+        // is unavailable statistics without a warning.
+        for containers in [vec![], vec![absent, inexact, missing]] {
+            let statistics = PrunableStatistics::new(containers, Arc::clone(&schema));
+            for result in quiet(&statistics, &column) {
+                assert!(matches!(result, Ok(None)), "{result:?}");
+            }
+            for result in quiet(&statistics, &Column::from_name("unknown")) {
+                assert!(matches!(result, Ok(None)), "{result:?}");
+            }
+        }
+
+        let typed_null =
+            exact_bounds(&schema, ScalarValue::Int64(None), ScalarValue::Int64(None));
         let statistics = PrunableStatistics::new(
-            vec![
-                bounded(1, 2),
-                Arc::new(Statistics::new_unknown(&schema)),
-                Arc::new(bounded(5, 6).as_ref().clone().to_inexact()),
-                bounded(10, 20),
-            ],
+            vec![typed_null, Arc::new(Statistics::new_unknown(&schema))],
             Arc::clone(&schema),
         );
-        for values in [
-            statistics.min_values(&Column::from_name("t")),
-            statistics.max_values(&Column::from_name("t")),
-        ] {
-            let values = values.expect("exact bounds convert beside unknown containers");
-            assert_eq!(values.data_type(), &data_type);
-            assert_eq!(
-                (0..values.len())
-                    .map(|i| values.is_valid(i))
-                    .collect::<Vec<_>>(),
-                [true, false, false, true]
-            );
+        for result in quiet(&statistics, &column) {
+            let values = result.unwrap().expect("exact typed nulls are statistics");
+            assert_eq!(values.data_type(), &DataType::Int64);
+            assert_eq!(values.null_count(), 2);
+        }
+    }
+
+    #[test]
+    fn incompatible_statistics_have_scrubbed_diagnostics() {
+        let tz = |tz: &str| Some(tz.into());
+        let cases = [
+            (DataType::Int64, ScalarValue::Int32(Some(424242))),
+            (
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, tz("+00:00")),
+                ScalarValue::TimestampNanosecond(Some(424242), tz("UTC")),
+            ),
+            (
+                DataType::Decimal128(20, 4),
+                ScalarValue::Decimal128(Some(424242), 10, 2),
+            ),
+            (DataType::Utf8View, ScalarValue::from("secret-424242")),
+        ];
+        for (data_type, value) in cases {
+            let schema = single_column(&data_type);
+            for first_known in [true, false] {
+                let mut containers =
+                    vec![exact_bounds(&schema, value.clone(), value.clone())];
+                containers.push(Arc::new(Statistics::new_unknown(&schema)));
+                if !first_known {
+                    containers.reverse();
+                }
+                let statistics = PrunableStatistics::new(containers, Arc::clone(&schema));
+                assert!(bounds_of(&statistics).iter().all(Option::is_none));
+                for bound in ["min", "max"] {
+                    let diagnostic = statistics
+                        .exact_column_statistics(&Column::from_name("c"), bound, |s| {
+                            if bound == "min" {
+                                &s.min_value
+                            } else {
+                                &s.max_value
+                            }
+                        })
+                        .unwrap_err();
+                    assert_eq!(
+                        diagnostic,
+                        format!(
+                            "Failed to convert {bound} values to array for column c: \
+                             statistics of type {} do not match column type {data_type}",
+                            value.data_type()
+                        )
+                    );
+                    assert!(!diagnostic.contains("424242"), "{diagnostic}");
+                }
+            }
         }
     }
 
