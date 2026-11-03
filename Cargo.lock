@@ -2417,9 +2417,7 @@ dependencies = [
  "bohmian-parquet-variant-json",
  "datafusion-common",
  "datafusion-expr",
- "datafusion-expr-common",
  "serde_json",
- "tokio",
 ]
 
 [[package]]

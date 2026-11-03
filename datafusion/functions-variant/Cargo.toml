@@ -45,11 +45,7 @@ sql = ["datafusion-expr/sql"]
 arrow = { workspace = true }
 datafusion-common = { workspace = true, features = ["variant"] }
 datafusion-expr = { workspace = true, default-features = false }
-datafusion-expr-common = { workspace = true }
 parquet-variant = { workspace = true }
 parquet-variant-compute = { workspace = true }
 parquet-variant-json = { workspace = true }
 serde_json = { workspace = true }
-
-[dev-dependencies]
-tokio = { workspace = true }
