@@ -1021,7 +1021,10 @@ impl DefaultPhysicalExprAdapterRewriter {
             return Ok(None);
         };
 
-        let physical_name = self.physical_file_schema.field(physical_column_index).name();
+        let physical_name = self
+            .physical_file_schema
+            .field(physical_column_index)
+            .name();
         let column = if column.index() == physical_column_index
             && column.name() == physical_name
         {
