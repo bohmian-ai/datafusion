@@ -26,7 +26,7 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::{DataType, FieldRef, Fields, SchemaRef};
+use arrow::datatypes::{DataType, Field, FieldRef, Fields, SchemaRef};
 use datafusion_common::{
     DataFusionError, Result, ScalarValue, exec_err,
     metadata::FieldMetadata,
@@ -169,6 +169,22 @@ pub trait PhysicalExprAdapter: Send + Sync + std::fmt::Debug {
     /// See Also:
     /// - [`replace_columns_with_literals`]: for replacing partition column references with their literal values.
     fn rewrite(&self, expr: Arc<dyn PhysicalExpr>) -> Result<Arc<dyn PhysicalExpr>>;
+
+    /// Rewrite a filter predicate to match the target schema.
+    ///
+    /// A predicate is evaluated for its boolean result, not returned as an
+    /// output column, so an adapter may omit reconciliations that only carry
+    /// a field's metadata to the output. File scans call this for the
+    /// predicate they prune and filter with, and [`Self::rewrite`] for the
+    /// projection.
+    ///
+    /// The default implementation delegates to [`Self::rewrite`].
+    fn rewrite_predicate(
+        &self,
+        expr: Arc<dyn PhysicalExpr>,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        self.rewrite(expr)
+    }
 }
 
 /// Creates instances of [`PhysicalExprAdapter`] for given logical and physical schemas.
@@ -270,15 +286,46 @@ impl DefaultPhysicalExprAdapter {
     }
 }
 
-impl PhysicalExprAdapter for DefaultPhysicalExprAdapter {
-    fn rewrite(&self, expr: Arc<dyn PhysicalExpr>) -> Result<Arc<dyn PhysicalExpr>> {
+impl DefaultPhysicalExprAdapter {
+    /// Rewrite `expr` in one fresh traversal; `predicate` selects
+    /// [`PhysicalExprAdapter::rewrite_predicate`]'s cast omission.
+    fn rewrite_expr(
+        &self,
+        expr: Arc<dyn PhysicalExpr>,
+        predicate: bool,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
         let mut rewriter = DefaultPhysicalExprAdapterRewriter {
             logical_file_schema: Arc::clone(&self.logical_file_schema),
             physical_file_schema: Arc::clone(&self.physical_file_schema),
             generated_casts: HashMap::new(),
+            predicate,
         };
         expr.transform(|expr| rewriter.rewrite_expr(Arc::clone(&expr)))
             .data()
+    }
+}
+
+impl PhysicalExprAdapter for DefaultPhysicalExprAdapter {
+    fn rewrite(&self, expr: Arc<dyn PhysicalExpr>) -> Result<Arc<dyn PhysicalExpr>> {
+        self.rewrite_expr(expr, false)
+    }
+
+    /// Like [`Self::rewrite`], except that a column whose file and table
+    /// fields differ only in ways a value cannot observe is referenced
+    /// directly instead of cast to the table field.
+    ///
+    /// The column's exact data type must be one of the ordinary scalar types
+    /// in both fields, and neither field may declare an Arrow extension type;
+    /// field metadata and nullability may differ. Such a cast changes no
+    /// value, but it hides the column from pruning that requires a bare
+    /// column, such as Bloom filters over an `IN` list. Every other cast,
+    /// including real conversions, nested, dictionary, and extension casts,
+    /// is kept, as is missing-column handling.
+    fn rewrite_predicate(
+        &self,
+        expr: Arc<dyn PhysicalExpr>,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        self.rewrite_expr(expr, true)
     }
 }
 
@@ -296,6 +343,9 @@ struct DefaultPhysicalExprAdapterRewriter {
     // pointer-address reuse. Keeping provenance here avoids adding markers to
     // expression types or threading it through rewrite results.
     generated_casts: HashMap<*const (), Arc<dyn PhysicalExpr>>,
+    // Whether the expression is a predicate, whose value-preserving scalar
+    // column casts are omitted (see `rewrite_predicate`).
+    predicate: bool,
 }
 
 /// Outcome of walking a `get_field` key path through nested struct fields.
@@ -366,6 +416,39 @@ fn contains_type(data_type: &DataType, predicate: &impl Fn(&DataType) -> bool) -
         DataType::Dictionary(_, values) => contains_type(values, predicate),
         _ => false,
     }
+}
+
+/// Whether casting a column of field `source` to field `target` changes no
+/// value: both have the same ordinary scalar data type, exactly (timestamp
+/// unit and timezone and fixed binary width included), and neither declares
+/// an Arrow extension type. Metadata and nullability are not compared.
+fn is_value_preserving_scalar_cast(source: &Field, target: &Field) -> bool {
+    source.data_type() == target.data_type()
+        && source.extension_type_name().is_none()
+        && target.extension_type_name().is_none()
+        && matches!(
+            source.data_type(),
+            DataType::Boolean
+                | DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+                | DataType::Float16
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Utf8View
+                | DataType::Binary
+                | DataType::LargeBinary
+                | DataType::BinaryView
+                | DataType::FixedSizeBinary(_)
+                | DataType::Timestamp(_, _)
+        )
 }
 
 /// Retain only the selected field path in a cast target, preserving its Struct
@@ -958,6 +1041,14 @@ impl DefaultPhysicalExprAdapterRewriter {
             }
 
             // If the fields match (including metadata/nullability), we can use the column as is
+            return Ok(Transformed::yes(Arc::new(resolved_column)));
+        }
+
+        // A predicate never returns this column's field, so a cast that
+        // changes no value only hides the column from pruning.
+        if self.predicate
+            && is_value_preserving_scalar_cast(&physical_field, logical_field)
+        {
             return Ok(Transformed::yes(Arc::new(resolved_column)));
         }
 
@@ -2009,6 +2100,7 @@ mod tests {
             logical_file_schema: Arc::new(logical_schema),
             physical_file_schema: Arc::new(physical_schema),
             generated_casts: HashMap::new(),
+            predicate: false,
         };
 
         // Test that when a field exists in physical schema, it returns None

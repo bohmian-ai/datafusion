@@ -138,7 +138,7 @@ impl PerFileParquetReadPlanner {
             .create(logical_file_schema, Arc::clone(&physical_file_schema))?;
         let simplifier = PhysicalExprSimplifier::new(&physical_file_schema);
         let filter = filter
-            .map(|filter| simplifier.simplify(rewriter.rewrite(filter)?))
+            .map(|filter| simplifier.simplify(rewriter.rewrite_predicate(filter)?))
             .transpose()?;
         let projection = projection
             .try_map_exprs(|expr| simplifier.simplify(rewriter.rewrite(expr)?))?;

@@ -1130,7 +1130,7 @@ impl MetadataLoadedParquetOpen {
             let simplifier = PhysicalExprSimplifier::new(&physical_for_rewrite);
             prepared.predicate = prepared
                 .predicate
-                .map(|p| simplifier.simplify(rewriter.rewrite(p)?))
+                .map(|p| simplifier.simplify(rewriter.rewrite_predicate(p)?))
                 .transpose()?;
             prepared.projection = prepared
                 .projection
@@ -2399,6 +2399,12 @@ mod test {
             self
         }
 
+        /// Enable row-group pruning by Bloom filters.
+        fn with_bloom_filter(mut self, enable: bool) -> Self {
+            self.enable_bloom_filter = enable;
+            self
+        }
+
         /// Enable page index.
         fn with_enable_page_index(mut self, enable: bool) -> Self {
             self.enable_page_index = enable;
@@ -3344,6 +3350,324 @@ mod test {
         assert_eq!(num_batches, 1);
         assert_eq!(num_rows, 3);
         assert_eq!(pruned_row_groups_statistics(&metrics), 0);
+    }
+
+    /// Sums the pruned row groups of the pruning metric `name`.
+    fn pruned_row_groups(metrics: &ExecutionPlanMetricsSet, name: &str) -> usize {
+        use datafusion_physical_plan::metrics::MetricValue;
+        metrics
+            .clone_inner()
+            .iter()
+            .filter_map(|m| match m.value() {
+                MetricValue::PruningMetrics {
+                    name: metric,
+                    pruning_metrics,
+                } if metric == name => Some(pruning_metrics.pruned()),
+                _ => None,
+            })
+            .sum()
+    }
+
+    /// A file field that differs from its table field only in metadata is
+    /// referenced bare by the adapted predicate, so long `IN` lists keep Bloom
+    /// and null-count pruning, while every cast that can change a value or its
+    /// extension semantics, and the projection's output metadata, are kept.
+    #[tokio::test]
+    async fn metadata_only_filter_casts_preserve_pruning() {
+        use parquet::file::reader::FileReader;
+        use parquet::file::serialized_reader::{
+            ReadOptionsBuilder, SerializedFileReader,
+        };
+
+        let note = || HashMap::from([("note".to_string(), "file".to_string())]);
+        let table_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("s", DataType::Utf8, true),
+        ]));
+        let props = || {
+            WriterProperties::builder()
+                .set_bloom_filter_enabled(true)
+                .set_max_row_group_row_count(Some(2))
+                .build()
+        };
+        for tagged in [false, true] {
+            let field = Field::new("s", DataType::Utf8, true);
+            let field = if tagged {
+                field.with_metadata(note())
+            } else {
+                field
+            };
+            let file_schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                field,
+            ]));
+            let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+            let scan = |name: &'static str, size: usize, expr: Expr| {
+                let store = Arc::clone(&store);
+                let table_schema = Arc::clone(&table_schema);
+                async move {
+                    let metrics = ExecutionPlanMetricsSet::new();
+                    let opener = ParquetMorselizerBuilder::new()
+                        .with_store(store)
+                        .with_table_schema(
+                            TableSchemaBuilder::from(&table_schema).build(),
+                        )
+                        .with_projection_indices(&[0])
+                        .with_predicate(logical2physical(&expr, &table_schema))
+                        .with_row_group_stats_pruning(true)
+                        .with_bloom_filter(true)
+                        .with_pushdown_filters(true)
+                        .with_metrics(metrics.clone())
+                        .build();
+                    let file = PartitionedFile::new(
+                        name.to_string(),
+                        u64::try_from(size).unwrap(),
+                    );
+                    let mut ids =
+                        collect_int32_values(open_file(&opener, file).await.unwrap())
+                            .await;
+                    ids.sort_unstable();
+                    let pruned = (
+                        pruned_row_groups(&metrics, "row_groups_pruned_statistics"),
+                        pruned_row_groups(&metrics, "row_groups_pruned_bloom_filter"),
+                    );
+                    (ids, pruned)
+                }
+            };
+
+            // One row group of `v-000`, `v-010`, ... `v-400`, `v-040` twice.
+            let values = (0..=40)
+                .map(|step| format!("v-{:03}", step * 10))
+                .chain(["v-040".to_string()])
+                .collect::<Vec<_>>();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&file_schema),
+                vec![
+                    Arc::new(arrow::array::Int32Array::from_iter_values(
+                        0..values.len() as i32,
+                    )),
+                    Arc::new(arrow::array::StringArray::from_iter_values(&values)),
+                ],
+            )
+            .unwrap();
+            let one_group = WriterProperties::builder()
+                .set_bloom_filter_enabled(true)
+                .build();
+            let size = write_parquet_batches(
+                Arc::clone(&store),
+                "bloom.parquet",
+                vec![batch],
+                Some(one_group),
+            )
+            .await;
+            let bytes = store
+                .get(&Path::from("bloom.parquet"))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            let reader = SerializedFileReader::new_with_options(
+                bytes,
+                ReadOptionsBuilder::new()
+                    .with_reader_properties(
+                        parquet::file::properties::ReaderProperties::builder()
+                            .set_read_bloom_filter(true)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .unwrap();
+            assert_eq!(reader.num_row_groups(), 1);
+            let group = reader.get_row_group(0).unwrap();
+            let bloom = group.get_column_bloom_filter(1).unwrap();
+            let probes = (1..400)
+                .filter(|value| value % 10 != 0)
+                .map(|value| format!("v-{value:03}"))
+                .filter(|probe| !bloom.check(&probe.as_str()))
+                .take(32)
+                .collect::<Vec<_>>();
+            assert_eq!(probes.len(), 32);
+            for size_of_list in [1, 3, 4, 8, 32] {
+                let list = probes[..size_of_list]
+                    .iter()
+                    .map(|probe| lit(probe.as_str()))
+                    .collect();
+                let (ids, pruned) =
+                    scan("bloom.parquet", size, col("s").in_list(list, false)).await;
+                assert!(ids.is_empty(), "tagged={tagged} absent {size_of_list}");
+                assert_eq!(
+                    pruned,
+                    (0, 1),
+                    "tagged={tagged}: absent {size_of_list} must fall to Bloom alone"
+                );
+            }
+            let present = ["v-040", "v-100", "v-999", "v-005"].map(lit).to_vec();
+            let (ids, _) =
+                scan("bloom.parquet", size, col("s").in_list(present, false)).await;
+            assert_eq!(ids, vec![4, 10, 41], "tagged={tagged} present list");
+
+            // Groups of mixed, all-null, and null-free values.
+            let batch = RecordBatch::try_new(
+                Arc::clone(&file_schema),
+                vec![
+                    Arc::new(arrow::array::Int32Array::from_iter_values(0..6)),
+                    Arc::new(arrow::array::StringArray::from(vec![
+                        Some("v-000"),
+                        None,
+                        None,
+                        None,
+                        Some("v-020"),
+                        Some("v-030"),
+                    ])),
+                ],
+            )
+            .unwrap();
+            let size = write_parquet_batches(
+                Arc::clone(&store),
+                "nulls.parquet",
+                vec![batch],
+                Some(props()),
+            )
+            .await;
+            let null = || lit(ScalarValue::Utf8(None));
+            for (expr, expected, pruned) in [
+                (
+                    col("s").in_list(
+                        vec![lit("v-000"), lit("v-020"), lit("v-777"), null()],
+                        false,
+                    ),
+                    vec![0, 4],
+                    None,
+                ),
+                (
+                    col("s").in_list(
+                        vec![lit("v-000"), lit("v-020"), lit("v-777"), null()],
+                        true,
+                    ),
+                    vec![],
+                    None,
+                ),
+                (col("s").is_null(), vec![1, 2, 3], Some((1, 0))),
+                (col("s").is_not_null(), vec![0, 4, 5], Some((1, 0))),
+            ] {
+                let (ids, actual) = scan("nulls.parquet", size, expr.clone()).await;
+                assert_eq!(ids, expected, "tagged={tagged} {expr}");
+                if let Some(pruned) = pruned {
+                    assert_eq!(actual, pruned, "tagged={tagged} {expr} null counts");
+                }
+            }
+        }
+
+        // The adapter omits only value-preserving scalar casts, and only from
+        // predicates.
+        let adapt = |physical: Field, logical: Field, predicate: bool| {
+            let column =
+                Arc::new(Column::new(logical.name(), 0)) as Arc<dyn PhysicalExpr>;
+            let adapter = DefaultPhysicalExprAdapterFactory
+                .create(
+                    Arc::new(Schema::new(vec![logical])),
+                    Arc::new(Schema::new(vec![physical])),
+                )
+                .unwrap();
+            if predicate {
+                adapter.rewrite_predicate(column).unwrap()
+            } else {
+                adapter.rewrite(column).unwrap()
+            }
+        };
+        let tz = || Some(Arc::from("UTC"));
+        for data_type in [
+            DataType::Boolean,
+            DataType::Int8,
+            DataType::Int64,
+            DataType::UInt32,
+            DataType::Float64,
+            DataType::Utf8,
+            DataType::Utf8View,
+            DataType::Binary,
+            DataType::FixedSizeBinary(16),
+            DataType::Timestamp(TimeUnit::Nanosecond, tz()),
+        ] {
+            let physical = Field::new("c", data_type.clone(), true).with_metadata(note());
+            let logical = Field::new("c", data_type.clone(), false);
+            let bare = adapt(physical.clone(), logical.clone(), true);
+            assert!(
+                bare.downcast_ref::<Column>().is_some(),
+                "{data_type} predicate"
+            );
+            let projected = adapt(physical, logical.clone(), false);
+            assert!(
+                projected
+                    .return_field(&Schema::new(vec![logical.clone()]))
+                    .unwrap()
+                    .as_ref()
+                    == &logical,
+                "{data_type} projection keeps the table field"
+            );
+        }
+        let extension = || {
+            HashMap::from([(
+                "ARROW:extension:name".to_string(),
+                "arrow.uuid".to_string(),
+            )])
+        };
+        let mut extended = extension();
+        extended.extend(note());
+        let struct_type =
+            DataType::Struct(vec![Field::new("x", DataType::Int64, true)].into());
+        let dictionary =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        for (physical, logical) in [
+            (
+                Field::new("c", DataType::Int32, true),
+                Field::new("c", DataType::Int64, true),
+            ),
+            (
+                Field::new("c", DataType::Timestamp(TimeUnit::Millisecond, tz()), true),
+                Field::new("c", DataType::Timestamp(TimeUnit::Microsecond, tz()), true),
+            ),
+            (
+                Field::new("c", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+                Field::new("c", DataType::Timestamp(TimeUnit::Microsecond, tz()), true),
+            ),
+            (
+                Field::new("c", DataType::FixedSizeBinary(16), true)
+                    .with_metadata(extended),
+                Field::new("c", DataType::FixedSizeBinary(16), true)
+                    .with_metadata(extension()),
+            ),
+            (
+                Field::new("c", struct_type.clone(), true).with_metadata(note()),
+                Field::new("c", struct_type, true),
+            ),
+            (
+                Field::new("c", dictionary.clone(), true).with_metadata(note()),
+                Field::new("c", dictionary, true),
+            ),
+        ] {
+            let adapted = adapt(physical.clone(), logical, true);
+            assert!(
+                adapted
+                    .downcast_ref::<datafusion_physical_expr::expressions::CastExpr>()
+                    .is_some(),
+                "{physical:?} keeps its cast"
+            );
+        }
+        // A column the file lacks still reads as NULL.
+        let missing = DefaultPhysicalExprAdapterFactory
+            .create(
+                Arc::new(Schema::new(vec![Field::new("c", DataType::Utf8, true)])),
+                Arc::new(Schema::new(vec![Field::new("d", DataType::Utf8, true)])),
+            )
+            .unwrap()
+            .rewrite_predicate(Arc::new(Column::new("c", 0)))
+            .unwrap();
+        assert!(
+            missing
+                .downcast_ref::<Literal>()
+                .is_some_and(|literal| literal.value().is_null())
+        );
     }
 
     #[tokio::test]
